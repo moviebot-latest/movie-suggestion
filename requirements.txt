@@ -1,5 +1,8 @@
-python-telegram-bot
+python-telegram-bot==20.7
 Flask
 requests
 aiohttp
 google-generativeai
+brotlicffi
+brotli
+httpx
