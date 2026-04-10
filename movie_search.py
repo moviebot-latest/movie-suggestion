@@ -6,14 +6,14 @@ import asyncio, requests, re
 from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from config import OMDB_API, TMDB_API, now_ist
+from config import OMDB_API, TMDB_API, now_ist, GROQ_API
 from config import (W_URL, W_NAME, W_MAINT_MSG, W_BROADCAST,
                     W_AI_QUERY, W_PLOT_SEARCH, W_LANG_FILTER,
                     W_ALERT_MOVIE, W_BAN_USER, W_QUIZ,
                     W_MOOD, W_COMPARE_1, W_COMPARE_2, W_RATE_MOVIE,
                     W_ADDADMIN)
 from storage import (is_banned, is_maintenance, is_admin, register_user,
-                     add_search_points, log_search, get_user_lang, load_servers)
+                     add_search_points, log_search, get_user_lang, load_servers, load_json)
 from helpers import progress_bar, animate_search, animate_generic, FRAMES, get_badge, build_star_bar
 from ai_engine import (ai_ask, ai_fix_movie_name, ai_movie_review, ai_fun_facts,
                        ai_full_review, ai_similar_deep, ai_mood_match,
