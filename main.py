@@ -8,6 +8,9 @@ from flask import Flask
 from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
                            CallbackQueryHandler, filters, ConversationHandler)
 from config import TOKEN, ADMIN_ID
+from config import (W_URL, W_NAME, W_MAINT_MSG, W_BROADCAST, W_BAN_USER,
+                    W_AI_QUERY, W_PLOT_SEARCH, W_MOOD, W_COMPARE_1, W_COMPARE_2,
+                    W_ADDADMIN)
 
 from server_checker  import (auto_server_checker, checkservers_cmd, serverstats_cmd,
                               srvchk_refresh_cb, srvchk_stats_cb, server_status_admin_cb,
@@ -16,8 +19,7 @@ from movie_search    import (start, start_btn_cb, movie, movieinfo_cmd,
                               fullreview_cmd, fullreview_cb, moodmatch_cmd, moodmatch_cb,
                               castinfo_cmd, castanalysis_cb, trivia_cmd, trivia_cb,
                               fullpackage_cb, review_cb, funfact_cb, rate_cb, dorat_cb,
-                              pick_cb, director_cb,
-                              W_AI_QUERY, W_PLOT_SEARCH, W_MOOD, W_COMPARE_1, W_COMPARE_2)
+                              pick_cb, director_cb)
 from upcoming        import (upcoming_cmd, upcom_remove_cmd, upcom_paginate_cb,
                               upcom_ai_cb, upcom_remind_cb, upcom_add_cb)
 from discovery       import trending_cmd, random_cmd, daily_cmd
@@ -40,8 +42,7 @@ from admin           import (admin_panel, clean_cmd, addadmin_cmd, adm_addadmin_
                               adm_maint_toggle, adm_stats_cb, adm_logs_cb, adm_send_alerts, sendalert_cmd,
                               adm_unban_prompt, do_unban_cb, adm_export_cb,
                               adm_listadmins_cb, adm_rmadmin_cb, adm_servers_cb,
-                              cancel, help_cmd,
-                              W_URL, W_NAME, W_MAINT_MSG, W_BROADCAST, W_BAN_USER, W_ADDADMIN)
+                              cancel, help_cmd)
 
 web_app = Flask(__name__)
 @web_app.route("/")

@@ -31,4 +31,8 @@ if GROQ_API:
 else:
     print("⚠️ GROQ_API not set — AI features disabled")
 
+# ── ConversationHandler states ──
+(W_URL, W_NAME, W_MAINT_MSG, W_BROADCAST, W_BAN_USER,
+ W_AI_QUERY, W_PLOT_SEARCH, W_MOOD, W_COMPARE_1, W_COMPARE_2,
+ W_ADDADMIN, W_LANG_FILTER, W_ALERT_MOVIE, W_QUIZ, W_RATE_MOVIE) = range(15)
 
