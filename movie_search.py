@@ -19,6 +19,7 @@ from ai_engine import (ai_ask, ai_fix_movie_name, ai_movie_review, ai_fun_facts,
                        ai_full_review, ai_similar_deep, ai_mood_match,
                        ai_cast_analysis, ai_trivia_quiz_movie)
 from movie_info import get_movie_info
+from helpers import get_omdb, get_omdb_search
 
 # ═══════════════════════════════════════════════════════════════════
 #                    CONVERSATION STATES — defined in config.py
@@ -597,7 +598,60 @@ async def trivia_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #       MOVIE SEARCH (OMDB)
 # ═══════════════════════════════════════════════════════════════════
 async def movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+    user  = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("🚫 *You are banned.*", parse_mode="Markdown")
+        return
+    if is_maintenance() and not is_admin(user.id):
+        maint = load_json("maintenance", {"active": False, "message": "🔧 Maintenance..."})
+        await update.message.reply_text(
+            f"🚧 *CineBot — Maintenance*\n\n{maint.get('message', '')}",
+            parse_mode="Markdown"
+        )
+        return
+    title = update.message.text.strip()
+    if not title:
+        return
+    register_user(user)
+    log_search(title, user.id)
+    add_search_points(user.id)
+
+    loader = await update.message.reply_text(
+        f"🔍 *\"{title}\"* search ho raha hai...\n" + progress_bar(1, 6),
+        parse_mode="Markdown"
+    )
+    await animate_search(loader)
+
+    # AI se naam fix karo agar galat ho
+    fixed_title = await ai_fix_movie_name(title) or title
+
+    data = await asyncio.to_thread(get_omdb, fixed_title)
+    try: await loader.delete()
+    except: pass
+
+    if not data or data.get("Response") == "False":
+        # Try OMDB search
+        results = await asyncio.to_thread(get_omdb_search, fixed_title)
+        if results:
+            keyboard = [[InlineKeyboardButton(
+                f"🎬 {r.get('Title','?')} ({r.get('Year','?')})",
+                callback_data=f"pick_{r.get('imdbID','')}"
+            )] for r in results[:5]]
+            await update.message.reply_text(
+                f"🔍 *\"{fixed_title}\"* — multiple results:\n\n_Ek select karo:_",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await update.message.reply_text(
+                f"😕 *\"{title}\"* — koi movie nahi mili.\n\n"
+                f"_Spelling check karo ya English mein try karo._",
+                parse_mode="Markdown"
+            )
+        return
+
+    await _send_movie_card(update, context, data, is_search=True)
+
 async def movieinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_maintenance() and not is_admin(update.effective_user.id):
         await update.message.reply_text("🚧 Maintenance mode.")
