@@ -4,3 +4,4 @@ requests==2.31.0
 aiohttp==3.9.3
 brotli
 brotlicffi
+beautifulsoup4>=4.12.0
