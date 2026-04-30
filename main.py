@@ -24,7 +24,7 @@ import logging
 import os
 import random
 import re
-importasync def auto_server_checker(bot: Bot, admin_id: int): sqlite3
+import sqlite3
 import threading
 import time
 from collections import defaultdict, deque
