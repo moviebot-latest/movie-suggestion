@@ -23,8 +23,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await repo.register_user(user.id, user.full_name, user.username, ref_id)
 
     await update.message.reply_text(
-        f"🎬 *Welcome to CineBot, {user.first_name}!*\n\n"
-        "Movie ka naam type karo ya neeche se koi feature choose karo 👇",
+        "╔══════════════════╗\n"
+        "     🎬 *CINEBOT*\n"
+        "╚══════════════════╝\n\n"
+        f"✨ Welcome, *{user.first_name}*!\n\n"
+        "🔎 Movie ka naam type karo, ya neeche se koi feature choose karo 👇",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard(),
     )
@@ -33,8 +36,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @guarded()
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "🎬 *CineBot — Commands*\n\n"
-        "*Search & Discover*\n"
+        "🎬 *CINEBOT — COMMAND GUIDE*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🔍 *Search & Discover*\n"
         "`/suggest` — AI movie recommendations\n"
         "`/plotsearch` — Find a movie by describing its plot\n"
         "`/mood` — Get suggestions based on your mood\n"
@@ -42,16 +46,16 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/trending` — Trending movies right now\n"
         "`/random` — Random movie pick\n"
         "`/upcoming` — This month's releases (or `/upcoming Movie Name 2027` to search a specific one)\n\n"
-        "*Your Stuff*\n"
+        "💼 *Your Stuff*\n"
         "`/watchlist` — Your saved movies\n"
         "`/alerts` — Get notified for keyword releases\n"
         "`/history` — Your search history\n"
         "`/mystats` — Your stats & badge\n"
         "`/leaderboard` — Top users\n\n"
-        "*Fun*\n"
+        "🎉 *Fun*\n"
         "`/quiz` — Movie trivia quiz\n"
         "`/refer` — Your referral link\n\n"
-        "Bas kisi movie ka naam type karo search karne ke liye!"
+        "💡 Bas kisi movie ka naam type karo search karne ke liye!"
     )
     if await repo.is_admin(update.effective_user.id):
         text += (

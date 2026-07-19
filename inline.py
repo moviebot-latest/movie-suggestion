@@ -29,7 +29,7 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         imdb_id = r.get("imdbID", "")
         poster = r.get("Poster")
         caption = f"🎬 *{title}* ({year})"
-        kb = movie_card_keyboard(imdb_id) if imdb_id else None
+        kb = movie_card_keyboard(imdb_id, title) if imdb_id else None
 
         if poster and poster != "N/A":
             items.append(

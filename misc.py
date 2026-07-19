@@ -23,7 +23,11 @@ async def quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = _random.choice(QUIZ_QUESTIONS)
     context.user_data["quiz_answer"] = q["answer"]
     kb = [[InlineKeyboardButton(opt, callback_data=f"quiz_ans_{i}")] for i, opt in enumerate(q["options"])]
-    await update.message.reply_text(f"🧠 *Quiz Time!*\n\n{q['q']}", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text(
+        f"🧠 *QUIZ TIME!*\n━━━━━━━━━━━━━━━━━━\n\n❓ {q['q']}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
 
 
 @guarded()
@@ -50,11 +54,13 @@ async def trending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for title in seeds:
         data = await get_omdb(title)
         if data and data.get("Response") == "True":
-            lines.append(f"🎬 {data.get('Title')} ({data.get('Year')}) — ⭐ {data.get('imdbRating', 'N/A')}")
+            lines.append(f"🎬 *{data.get('Title')}* ({data.get('Year')}) — ⭐ {data.get('imdbRating', 'N/A')}/10")
     if not lines:
         await update.message.reply_text("❌ Trending fetch nahi ho paya.")
         return
-    await update.message.reply_text("🔥 *Trending Now*\n\n" + "\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text(
+        "🔥 *TRENDING NOW*\n━━━━━━━━━━━━━━━━━━\n\n" + "\n".join(lines), parse_mode="Markdown"
+    )
 
 
 @guarded()
@@ -67,7 +73,9 @@ async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await get_omdb(title)
     if data and data.get("Response") == "True":
         from formatting import movie_card_text
-        await update.message.reply_text(f"📅 *Movie of the Day*\n\n{movie_card_text(data)}", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"📅 *MOVIE OF THE DAY*\n━━━━━━━━━━━━━━━━━━\n\n{movie_card_text(data)}", parse_mode="Markdown"
+        )
     else:
         await update.message.reply_text("❌ Kuch error aa gaya.")
 
@@ -84,4 +92,8 @@ async def back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     from keyboards import main_menu_keyboard
-    await query.message.reply_text("🎬 *Main Menu*", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    await query.message.reply_text(
+        "╔══════════════════╗\n     🎬 *MAIN MENU*\n╚══════════════════╝",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
+    )

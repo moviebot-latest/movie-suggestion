@@ -13,9 +13,10 @@ from keyboards import movie_card_keyboard
 
 async def _send_movie_card(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict, reply_to=None):
     imdb_id = data.get("imdbID", "")
+    title = data.get("Title", "")
     text = movie_card_text(data)
     poster = data.get("Poster")
-    kb = movie_card_keyboard(imdb_id)
+    kb = movie_card_keyboard(imdb_id, title)
 
     target = reply_to or update.effective_message
 
@@ -80,7 +81,7 @@ async def movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     for r in results if r.get("imdbID")
                 ]
                 await update.message.reply_text(
-                    f"🔍 *Multiple Results* for *'{raw_name}'*\n\nChoose karo 👇",
+                    f"🔍 *MULTIPLE RESULTS* for _'{raw_name}'_\n━━━━━━━━━━━━━━━━━━\n\nSahi wali choose karo 👇",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(keyboard),
                 )

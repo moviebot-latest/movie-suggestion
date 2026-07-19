@@ -102,13 +102,16 @@ async def compare_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = update.callback_query.message if update.callback_query else update.message
     if update.callback_query:
         await update.callback_query.answer()
-    await target.reply_text("⚖️ *Compare Movies*\n\nPehli movie ka naam bhejo:\n\n/cancel", parse_mode="Markdown")
+    await target.reply_text(
+        "⚖️ *COMPARE MOVIES*\n━━━━━━━━━━━━━━━━━━\n\n🎬 Pehli movie ka naam bhejo:\n\n_/cancel to stop_",
+        parse_mode="Markdown",
+    )
     return W_COMPARE_1
 
 
 async def compare_recv1(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["compare_movie1"] = update.message.text.strip()
-    await update.message.reply_text("Ab dusri movie ka naam bhejo:")
+    await update.message.reply_text("🎬 Ab dusri movie ka naam bhejo:")
     return W_COMPARE_2
 
 

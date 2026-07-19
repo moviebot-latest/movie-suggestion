@@ -14,18 +14,26 @@ W_BROADCAST, W_BAN_USER, W_MAINT_MSG, W_ADDADMIN = range(100, 104)
 
 def _admin_menu_keyboard() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast"),
-         InlineKeyboardButton("🚫 Ban User", callback_data="adm_ban")],
-        [InlineKeyboardButton("✅ Unban User", callback_data="adm_unban"),
-         InlineKeyboardButton("🔧 Maintenance", callback_data="adm_maint_toggle")],
         [InlineKeyboardButton("📊 Stats", callback_data="adm_stats"),
-         InlineKeyboardButton("👥 List Admins", callback_data="adm_listadmins")],
-        [InlineKeyboardButton("➕ Add Admin", callback_data="adm_addadmin"),
          InlineKeyboardButton("🤖 Groq Status", callback_data="adm_groqstatus")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast")],
+        [InlineKeyboardButton("🚫 Ban User", callback_data="adm_ban"),
+         InlineKeyboardButton("✅ Unban User", callback_data="adm_unban")],
+        [InlineKeyboardButton("👥 List Admins", callback_data="adm_listadmins"),
+         InlineKeyboardButton("➕ Add Admin", callback_data="adm_addadmin")],
+        [InlineKeyboardButton("🔧 Maintenance Mode", callback_data="adm_maint_toggle")],
         [InlineKeyboardButton("🛑 Shutdown", callback_data="adm_shutdown_confirm"),
-         InlineKeyboardButton("✅ Recover", callback_data="adm_recover")],
+         InlineKeyboardButton("♻️ Recover", callback_data="adm_recover")],
     ]
     return InlineKeyboardMarkup(rows)
+
+
+_ADMIN_PANEL_TEXT = (
+    "╔══════════════════╗\n"
+    "   🛠 *ADMIN PANEL*\n"
+    "╚══════════════════╝\n\n"
+    "_Bot ko yahan se manage karo_ 👇"
+)
 
 
 @guarded(require_admin=True)
@@ -33,7 +41,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = update.callback_query.message if update.callback_query else update.message
     if update.callback_query:
         await update.callback_query.answer()
-    await target.reply_text("🛠 *Admin Panel*", parse_mode="Markdown", reply_markup=_admin_menu_keyboard())
+    await target.reply_text(_ADMIN_PANEL_TEXT, parse_mode="Markdown", reply_markup=_admin_menu_keyboard())
 
 
 @guarded(require_admin=True)
@@ -44,10 +52,12 @@ async def adm_stats_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     banned = await repo.list_banned()
     admins = await repo.list_admins()
     await query.message.reply_text(
-        f"📊 *Bot Stats*\n\n"
-        f"👥 Users: `{total_users}`\n"
-        f"🚫 Banned: `{len(banned)}`\n"
-        f"👮 Sub-admins: `{len(admins)}`",
+        "📊 *BOT STATISTICS*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Total Users     `{total_users}`\n"
+        f"🚫 Banned Users    `{len(banned)}`\n"
+        f"👮 Sub-admins      `{len(admins)}`\n"
+        "━━━━━━━━━━━━━━━━━━",
         parse_mode="Markdown",
     )
 
@@ -58,10 +68,13 @@ async def adm_listadmins_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     rows = await repo.list_admins()
     if not rows:
-        await query.message.reply_text("Koi sub-admins nahi hain.")
+        await query.message.reply_text("👮 *Admins*\n\n_Koi sub-admins nahi hain._", parse_mode="Markdown")
         return
-    lines = [f"• `{r['user_id']}` ({r['admin_type']})" for r in rows]
-    await query.message.reply_text("👮 *Admins*\n\n" + "\n".join(lines), parse_mode="Markdown")
+    lines = [f"▫️ `{r['user_id']}`  —  _{r['admin_type']}_" for r in rows]
+    await query.message.reply_text(
+        "👮 *SUB-ADMINS*\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines),
+        parse_mode="Markdown",
+    )
 
 
 @guarded(require_admin=True)

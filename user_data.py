@@ -15,11 +15,14 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     rows = await repo.watchlist_get(user_id)
     if not rows:
-        await update.message.reply_text("📋 Watchlist khali hai. Kisi movie card se '💾 Watchlist' dabao.")
+        await update.message.reply_text(
+            "📋 *Watchlist khali hai*\n\n_Kisi movie card se_ 💾 *'Add to Watchlist'* _dabao!_",
+            parse_mode="Markdown",
+        )
         return
-    lines = [f"• {r['title']}" for r in rows]
+    lines = [f"🎞 {r['title']}" for r in rows]
     await update.message.reply_text(
-        "📋 *Your Watchlist*\n━━━━━━━━━━━━━━━━━━\n\n" + "\n".join(lines), parse_mode="Markdown"
+        "📋 *YOUR WATCHLIST*\n━━━━━━━━━━━━━━━━━━\n\n" + "\n".join(lines), parse_mode="Markdown"
     )
 
 
@@ -46,7 +49,9 @@ async def rate_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     imdb_id = query.data.split("_", 1)[1]
-    await query.message.reply_text("⭐ Rate this movie (1-10):", reply_markup=rating_keyboard(imdb_id))
+    await query.message.reply_text(
+        "⭐ *Rate this movie*\n\n_1 (worst) — 10 (best)_ 👇", parse_mode="Markdown", reply_markup=rating_keyboard(imdb_id)
+    )
 
 
 @guarded()
@@ -73,12 +78,16 @@ async def alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     rows = await repo.alert_list(user_id)
     if not rows:
-        await update.message.reply_text("🔔 Koi alerts nahi hain.\nUsage: `/alerts <keyword>`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "🔔 *Koi alerts nahi hain*\n\n_Usage:_ `/alerts <keyword>`", parse_mode="Markdown"
+        )
         return
     kb = [[InlineKeyboardButton(f"🗑 {r['keyword']}", callback_data=f"alert_del|{r['keyword']}")] for r in rows]
     kb.append([InlineKeyboardButton("🗑 Clear All", callback_data="alert_clear")])
     await update.message.reply_text(
-        "🔔 *Your Alerts* (tap to remove)", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
+        "🔔 *YOUR ALERTS*\n━━━━━━━━━━━━━━━━━━\n_Tap to remove_ 👇",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb),
     )
 
 
@@ -110,10 +119,12 @@ async def alert_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = await repo.get_history(update.effective_user.id, limit=20)
     if not rows:
-        await update.message.reply_text("📜 Koi search history nahi hai abhi tak.")
+        await update.message.reply_text("📜 *Koi search history nahi hai abhi tak.*", parse_mode="Markdown")
         return
-    lines = [f"• {r['query']}" for r in rows]
-    await update.message.reply_text("📜 *Recent Searches*\n\n" + "\n".join(lines), parse_mode="Markdown")
+    lines = [f"🔍 {r['query']}" for r in rows]
+    await update.message.reply_text(
+        "📜 *RECENT SEARCHES*\n━━━━━━━━━━━━━━━━━━\n\n" + "\n".join(lines), parse_mode="Markdown"
+    )
 
 
 @guarded()
@@ -131,11 +142,13 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🌱 Newbie"
     )
     await update.message.reply_text(
-        f"📊 *Your Stats*\n\n"
-        f"🔍 Searches: `{user['searches']}`\n"
-        f"⭐ Points: `{points}`\n"
-        f"🏅 Badge: {badge}\n"
-        f"📅 Joined: `{user['joined_at'].strftime('%d %b %Y')}`",
+        "📊 *YOUR STATS*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🔍 Searches   `{user['searches']}`\n"
+        f"⭐ Points     `{points}`\n"
+        f"🏅 Badge      {badge}\n"
+        f"📅 Joined     `{user['joined_at'].strftime('%d %b %Y')}`\n"
+        "━━━━━━━━━━━━━━━━━━",
         parse_mode="Markdown",
     )
 
@@ -144,10 +157,16 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = await repo.leaderboard(10)
     if not rows:
-        await update.message.reply_text("Leaderboard khali hai.")
+        await update.message.reply_text("🏆 *Leaderboard khali hai.*", parse_mode="Markdown")
         return
-    lines = [f"{i+1}. {r['name']} — {r['points']} pts" for i, r in enumerate(rows)]
-    await update.message.reply_text("🏆 *Leaderboard*\n\n" + "\n".join(lines), parse_mode="Markdown")
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, r in enumerate(rows):
+        rank = medals[i] if i < 3 else f"{i+1}."
+        lines.append(f"{rank} *{r['name']}* — `{r['points']} pts`")
+    await update.message.reply_text(
+        "🏆 *LEADERBOARD*\n━━━━━━━━━━━━━━━━━━\n\n" + "\n".join(lines), parse_mode="Markdown"
+    )
 
 
 @guarded()
@@ -156,7 +175,8 @@ async def refer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     link = f"https://t.me/{bot_username}?start={user_id}"
     await update.message.reply_text(
-        f"🎁 *Refer & Earn*\n\nApna link share karo:\n{link}\n\n"
-        "Jab koi is link se join karega, tumhe points milenge!",
+        "🎁 *REFER & EARN*\n━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔗 Apna link share karo:\n{link}\n\n"
+        "✨ Jab koi is link se join karega, tumhe points milenge!",
         parse_mode="Markdown",
     )
