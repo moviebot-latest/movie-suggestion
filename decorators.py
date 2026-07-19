@@ -13,7 +13,7 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from bot.db import repository as repo
+import repository as repo
 
 log = logging.getLogger("cinebot.decorators")
 

@@ -13,8 +13,8 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from bot.config import ADMIN_ID
-from bot.db.database import get_pool
+from config import ADMIN_ID
+from database import get_pool
 
 
 # ── Users ────────────────────────────────────────────────────────

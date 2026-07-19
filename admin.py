@@ -5,9 +5,9 @@ import asyncio
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes, ConversationHandler
 
-from bot.config import ADMIN_ID
-from bot.db import repository as repo
-from bot.utils.decorators import guarded
+from config import ADMIN_ID
+import repository as repo
+from decorators import guarded
 
 W_BROADCAST, W_BAN_USER, W_MAINT_MSG, W_ADDADMIN = range(100, 104)
 
@@ -256,7 +256,7 @@ def _format_groq_status(status: dict | None) -> str:
 
 @guarded(require_admin=True)
 async def groqstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from bot.services.groq_ai import check_groq_status
+    from groq_ai import check_groq_status
     loader = await update.message.reply_text("🤖 Checking Groq key...")
     status = await check_groq_status()
     try:
@@ -273,7 +273,7 @@ async def groqstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def adm_groqstatus_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("🤖 Checking...")
-    from bot.services.groq_ai import check_groq_status
+    from groq_ai import check_groq_status
     status = await check_groq_status()
     text = _format_groq_status(status)
     if not status["active"]:
@@ -301,7 +301,7 @@ async def setgroqkey_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         delete_failed = True
 
-    from bot.services.groq_ai import set_groq_key, check_groq_status
+    from groq_ai import set_groq_key, check_groq_status
     await set_groq_key(new_key)
     loader = await context.bot.send_message(update.effective_chat.id, "🔄 Key saved. Verifying it works...")
     status = await check_groq_status()

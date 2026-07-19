@@ -3,9 +3,9 @@ from __future__ import annotations
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from bot.db import repository as repo
-from bot.db.database import get_pool
-from bot.utils.decorators import guarded
+import repository as repo
+from database import get_pool
+from decorators import guarded
 
 LANGUAGES = ["Hindi", "English", "Tamil", "Telugu", "Punjabi", "Any"]
 

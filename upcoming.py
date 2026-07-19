@@ -6,10 +6,10 @@ from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from bot.db import repository as repo
-from bot.services.tmdb import get_movies_for_month, get_trailer, search_by_name
-from bot.utils.decorators import guarded
-from bot.utils.formatting import now_ist, today_ist
+import repository as repo
+from tmdb import get_movies_for_month, get_trailer, search_by_name
+from decorators import guarded
+from formatting import now_ist, today_ist
 
 
 def _nav_keyboard() -> InlineKeyboardMarkup:

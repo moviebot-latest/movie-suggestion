@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 import redis.asyncio as redis
 
-from bot.config import REDIS_URL
+from config import REDIS_URL
 
 log = logging.getLogger("cinebot.cache")
 

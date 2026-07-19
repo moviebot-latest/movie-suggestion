@@ -17,8 +17,8 @@ from urllib.parse import quote
 
 import aiohttp
 
-from bot.config import OMDB_API_KEY, CACHE_TTL_OMDB, CACHE_TTL_SEARCH
-from bot.services.cache import cache_get, cache_set
+from config import OMDB_API_KEY, CACHE_TTL_OMDB, CACHE_TTL_SEARCH
+from cache import cache_get, cache_set
 
 log = logging.getLogger("cinebot.omdb")
 

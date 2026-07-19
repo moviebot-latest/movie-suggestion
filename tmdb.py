@@ -10,7 +10,7 @@ from typing import Optional
 
 import aiohttp
 
-from bot.config import TMDB_API_KEY, CACHE_TTL_TMDB
+from config import TMDB_API_KEY, CACHE_TTL_TMDB
 
 log = logging.getLogger("cinebot.tmdb")
 
@@ -34,7 +34,7 @@ def _genre_names(ids: list) -> str:
     return ", ".join(names[:3]) if names else "N/A"
 
 
-from bot.services.cache import cache_get, cache_set
+from cache import cache_get, cache_set
 
 
 async def _get(path: str, params: dict) -> Optional[dict]:

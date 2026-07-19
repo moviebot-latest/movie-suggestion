@@ -3,10 +3,10 @@ from __future__ import annotations
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from bot.services.omdb import get_omdb
-from bot.services.groq_ai import ai_movie_review, ai_cast_analysis, ai_trivia
-from bot.services.tmdb import search_by_name, get_credits, get_similar, get_movie_details
-from bot.utils.decorators import guarded
+from omdb import get_omdb
+from groq_ai import ai_movie_review, ai_cast_analysis, ai_trivia
+from tmdb import search_by_name, get_credits, get_similar, get_movie_details
+from decorators import guarded
 
 
 @guarded()

@@ -14,9 +14,9 @@ from datetime import datetime
 
 from telegram.ext import Application
 
-from bot.db import repository as repo
-from bot.db.database import get_pool
-from bot.utils.formatting import today_ist
+import repository as repo
+from database import get_pool
+from formatting import today_ist
 
 log = logging.getLogger("cinebot.background")
 

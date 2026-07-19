@@ -3,10 +3,10 @@ from __future__ import annotations
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from bot.db import repository as repo
-from bot.services.omdb import get_omdb
-from bot.utils.decorators import guarded
-from bot.utils.keyboards import rating_keyboard
+import repository as repo
+from omdb import get_omdb
+from decorators import guarded
+from keyboards import rating_keyboard
 
 
 # ── Watchlist ────────────────────────────────────────────────────

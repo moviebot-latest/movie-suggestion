@@ -9,24 +9,24 @@ from telegram.ext import (
     MessageHandler, filters,
 )
 
-from bot.config import BOT_TOKEN
-from bot.db.database import init_pool, close_pool
-from bot.services.cache import init_cache, close_cache
-from bot.services.background import start_background_tasks
+from config import BOT_TOKEN
+from database import init_pool, close_pool
+from cache import init_cache, close_cache
+from background import start_background_tasks
 
-from bot.handlers.start import start, help_cmd, start_btn_cb
-from bot.handlers.search import movie, pick_cb, movieinfo_cmd, random_cmd
-from bot.handlers.ai_convo import (
+from start import start, help_cmd, start_btn_cb
+from search import movie, pick_cb, movieinfo_cmd, random_cmd
+from ai_convo import (
     suggest_cmd, suggest_receive, plotsearch_cmd, plotsearch_receive,
     mood_cmd, mood_receive, compare_cmd, compare_recv1, compare_recv2,
     cancel, W_AI_QUERY, W_PLOT_SEARCH, W_MOOD, W_COMPARE_1, W_COMPARE_2,
 )
-from bot.handlers.user_data import (
+from user_data import (
     watchlist_cmd, wl_save_cb, wl_clear_cb, rate_cb, dorat_cb,
     alerts_cmd, alert_add_cb, alert_del_cb, alert_clear_cb,
     history_cmd, mystats_cmd, leaderboard_cmd, refer_cmd,
 )
-from bot.handlers.admin import (
+from admin import (
     admin_panel, adm_stats_cb, adm_listadmins_cb, listadmins_cmd,
     adm_broadcast_prompt, adm_do_broadcast,
     adm_ban_prompt, adm_do_ban, adm_unban_prompt, do_unban_cb,
@@ -36,31 +36,31 @@ from bot.handlers.admin import (
     shutdown_cmd, recover_cmd, adm_shutdown_confirm_cb, adm_shutdown_do_cb, adm_recover_cb,
     W_BROADCAST, W_BAN_USER, W_MAINT_MSG, W_ADDADMIN,
 )
-from bot.handlers.upcoming import (
+from upcoming import (
     upcoming_cmd, upcom_paginate_cb, upcom_ai_cb, upcom_remind_cb,
     upcom_add_cb, upcom_remove_cmd, upcom_pick_cb,
 )
-from bot.handlers.ai_analysis import (
+from ai_analysis import (
     review_cb, fullreview_cmd, fullreview_cb, moodmatch_cmd, moodmatch_cb,
     castinfo_cmd, castanalysis_cb, trivia_cmd, trivia_cb, funfact_cb,
     fullpackage_cb, similar_cb,
 )
-from bot.handlers.misc import (
+from misc import (
     quiz_cmd, quiz_answer_cb, trending_cmd, daily_cmd, clean_cmd,
     back_cb,
 )
-from bot.handlers.lang import (
+from lang import (
     lang_cmd, setlang_cb, lang_stats, lang_bulk_reset,
     adminlang_cb, adminpanel_lang_start, lang_cancel_cb,
 )
-from bot.handlers.servers import (
+from servers import (
     checkservers_cmd, srvchk_refresh_cb, serverstats_cmd, srvchk_stats_cb,
     server_status_admin_cb, sendalert_cmd, failoverlog_cmd,
     adm_servers_cb, adm_logs_cb, adm_send_alerts, adm_export_cb, adm_back,
     adm_addadmin_cb, adm_addadmin_recv, adm_reset, adm_edit, adm_rmadmin_cb,
     failover_undo_cb, failover_keep_cb, ai_approve_cb, ai_reject_cb, ai_edit_cb,
 )
-from bot.handlers.inline import inline_query_handler
+from inline import inline_query_handler
 
 log = logging.getLogger("cinebot.app")
 

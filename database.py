@@ -26,7 +26,7 @@ from typing import Optional
 
 import asyncpg
 
-from bot.config import DATABASE_URL
+from config import DATABASE_URL
 
 log = logging.getLogger("cinebot.db")
 

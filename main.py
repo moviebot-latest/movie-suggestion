@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import logging
 
-from bot.config import PORT, WEBHOOK_PATH, WEBHOOK_URL, BOT_TOKEN
-from bot.app import build_application
+from config import PORT, WEBHOOK_PATH, WEBHOOK_URL, BOT_TOKEN
+from app import build_application
 
 log = logging.getLogger("cinebot.main")
 

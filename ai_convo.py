@@ -3,10 +3,10 @@ from __future__ import annotations
 from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler
 
-from bot.services.groq_ai import ai_recommend, ai_plot_search
-from bot.services.omdb import get_omdb
-from bot.utils.decorators import guarded
-from bot.utils.formatting import movie_card_text
+from groq_ai import ai_recommend, ai_plot_search
+from omdb import get_omdb
+from decorators import guarded
+from formatting import movie_card_text
 
 W_AI_QUERY, W_PLOT_SEARCH, W_MOOD, W_COMPARE_1, W_COMPARE_2 = range(5)
 
@@ -81,7 +81,7 @@ async def mood_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def mood_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from bot.services.groq_ai import ai_mood_match
+    from groq_ai import ai_mood_match
     mood = update.message.text.strip()
     loader = await update.message.reply_text("🤖 Finding movies for your mood...")
     result = await ai_mood_match(mood)

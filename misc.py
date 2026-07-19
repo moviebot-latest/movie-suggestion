@@ -5,9 +5,9 @@ import random as _random
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from bot.db import repository as repo
-from bot.services.omdb import get_omdb
-from bot.utils.decorators import guarded
+import repository as repo
+from omdb import get_omdb
+from decorators import guarded
 
 QUIZ_QUESTIONS = [
     {"q": "Which movie won Best Picture at the 2020 Oscars?", "options": ["Parasite", "1917", "Joker", "Ford v Ferrari"], "answer": 0},
@@ -59,14 +59,14 @@ async def trending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @guarded()
 async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from bot.utils.formatting import today_ist
+    from formatting import today_ist
     seeds = ["Inception", "Interstellar", "Parasite", "RRR", "The Dark Knight",
              "3 Idiots", "Dangal", "Gladiator", "Pulp Fiction", "The Matrix"]
     day_index = today_ist().toordinal() % len(seeds)
     title = seeds[day_index]
     data = await get_omdb(title)
     if data and data.get("Response") == "True":
-        from bot.utils.formatting import movie_card_text
+        from formatting import movie_card_text
         await update.message.reply_text(f"📅 *Movie of the Day*\n\n{movie_card_text(data)}", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Kuch error aa gaya.")
@@ -83,5 +83,5 @@ async def clean_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    from bot.utils.keyboards import main_menu_keyboard
+    from keyboards import main_menu_keyboard
     await query.message.reply_text("🎬 *Main Menu*", parse_mode="Markdown", reply_markup=main_menu_keyboard())

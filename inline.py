@@ -12,8 +12,8 @@ from telegram import (
 )
 from telegram.ext import ContextTypes
 
-from bot.services.omdb import get_omdb_search
-from bot.utils.keyboards import movie_card_keyboard
+from omdb import get_omdb_search
+from keyboards import movie_card_keyboard
 
 
 async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):

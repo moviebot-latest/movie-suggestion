@@ -3,9 +3,9 @@ from __future__ import annotations
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from bot.db import repository as repo
-from bot.utils.decorators import guarded
-from bot.utils.keyboards import main_menu_keyboard
+import repository as repo
+from decorators import guarded
+from keyboards import main_menu_keyboard
 
 
 @guarded()
@@ -86,5 +86,5 @@ async def start_btn_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in routes:
         await query.message.reply_text(f"👉 Use /{routes[data]} command.")
     elif data == "open_admin":
-        from bot.handlers.admin import admin_panel
+        from admin import admin_panel
         await admin_panel(update, context)

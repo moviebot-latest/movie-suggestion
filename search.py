@@ -3,12 +3,12 @@ from __future__ import annotations
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from bot.db import repository as repo
-from bot.services.omdb import get_omdb, get_omdb_search
-from bot.services.groq_ai import ai_fix_movie_name
-from bot.utils.decorators import guarded
-from bot.utils.formatting import movie_card_text
-from bot.utils.keyboards import movie_card_keyboard
+import repository as repo
+from omdb import get_omdb, get_omdb_search
+from groq_ai import ai_fix_movie_name
+from decorators import guarded
+from formatting import movie_card_text
+from keyboards import movie_card_keyboard
 
 
 async def _send_movie_card(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict, reply_to=None):

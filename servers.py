@@ -6,9 +6,9 @@ import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from bot.db import repository as repo
-from bot.db.database import get_pool
-from bot.utils.decorators import guarded
+import repository as repo
+from database import get_pool
+from decorators import guarded
 
 DEFAULT_SERVERS = {
     "server1": {"name": "Primary Mirror", "url": "https://example.com"},
@@ -142,7 +142,7 @@ async def adm_export_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @guarded(require_admin=True)
 async def adm_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from bot.handlers.admin import admin_panel
+    from admin import admin_panel
     await admin_panel(update, context)
 
 
@@ -151,7 +151,7 @@ async def adm_addadmin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.message.reply_text("User ID bhejo naya admin banane ke liye:\n\n/cancel")
-    from bot.handlers.admin import W_ADDADMIN
+    from admin import W_ADDADMIN
     return W_ADDADMIN
 
 
