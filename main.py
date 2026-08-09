@@ -28,6 +28,18 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 
 # ═══════════════════════════════════════════════════════════════════
+#                      CONFIG / ENV VARIABLES
+# ═══════════════════════════════════════════════════════════════════
+TOKEN = os.getenv("TOKEN") or os.getenv("BOT_TOKEN")
+GROQ_API = os.getenv("GROQ_API") or os.getenv("GROQ_API_KEY")
+TMDB_API = os.getenv("TMDB_API") or os.getenv("TMDB_API_KEY")
+OMDB_API = os.getenv("OMDB_API") or os.getenv("OMDB_API_KEY")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
+
+if not TOKEN:
+    raise RuntimeError("TOKEN env variable is not set. Set it in Render's Environment tab.")
+
+# ═══════════════════════════════════════════════════════════════════
 #                      PERSISTENT STORAGE
 # ═══════════════════════════════════════════════════════════════════
 FILES = {
