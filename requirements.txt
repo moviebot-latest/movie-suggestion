@@ -5,3 +5,5 @@ asyncpg==0.30.0
 redis==5.2.1
 aiohttp==3.11.11
 requests
+beautifulsoup4
+groq

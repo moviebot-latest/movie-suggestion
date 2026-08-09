@@ -8,11 +8,14 @@ import sqlite3
 import threading
 import asyncio
 import traceback
-from datetime import datetime, timedelta
+import calendar
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
+from urllib.parse import urlparse
 
 import requests
 import aiohttp
+from bs4 import BeautifulSoup
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import (
@@ -36,8 +39,31 @@ TMDB_API = os.getenv("TMDB_API") or os.getenv("TMDB_API_KEY")
 OMDB_API = os.getenv("OMDB_API") or os.getenv("OMDB_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 
+# Aliases used elsewhere in the file with the "_KEY" suffix
+TMDB_API_KEY = TMDB_API
+OMDB_API_KEY = OMDB_API
+
+# Timezone: Indian Standard Time (UTC+5:30), used for all display timestamps
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# Groq REST API config (used by the lightweight HTTP-based AI calls)
+GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
 if not TOKEN:
     raise RuntimeError("TOKEN env variable is not set. Set it in Render's Environment tab.")
+
+# Optional: Groq Python SDK client (used by HealerV4 for AI-assisted domain
+# recovery). Falls back to None if the `groq` package isn't installed or no
+# API key is set — the bot still runs fine, just without SDK-based healing.
+_groq_sdk_client = None
+if GROQ_API:
+    try:
+        from groq import Groq as _GroqSDK
+        _groq_sdk_client = _GroqSDK(api_key=GROQ_API)
+    except Exception as _e:
+        print(f"⚠️ Groq SDK not available ({_e}); falling back to REST calls only.")
+        _groq_sdk_client = None
 
 # ═══════════════════════════════════════════════════════════════════
 #                      PERSISTENT STORAGE
