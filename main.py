@@ -11,7 +11,7 @@ import traceback
 import calendar
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 import requests
 import aiohttp
@@ -49,6 +49,14 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # Groq REST API config (used by the lightweight HTTP-based AI calls)
 GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+def now_ist() -> datetime:
+    """Current time as an IST-aware datetime."""
+    return datetime.now(IST)
+
+def today_ist():
+    """Current date (no time component) in IST."""
+    return datetime.now(IST).date()
 
 if not TOKEN:
     raise RuntimeError("TOKEN env variable is not set. Set it in Render's Environment tab.")
