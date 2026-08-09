@@ -1,4 +1,30 @@
+import os
+import json
+import re
+import time
+import random
+import logging
+import sqlite3
+import threading
+import asyncio
+import traceback
+from datetime import datetime, timedelta
 
+import requests
+import aiohttp
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    filters,
+)
+
+logging.basicConfig(level=logging.INFO)
 
 # ═══════════════════════════════════════════════════════════════════
 #                      PERSISTENT STORAGE
