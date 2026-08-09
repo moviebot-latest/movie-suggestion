@@ -1853,6 +1853,137 @@ async def healerlog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+# ── Shared: build the server-status text + refresh/stats keyboard ──
+async def _build_server_status_view():
+    if not _healer:
+        return "⚠️ Healer not initialized.", None
+    servers = load_servers()
+    lines = ["📡 *SERVER STATUS*\n━━━━━━━━━━━━━━━━━━"]
+    for key, info in servers.items():
+        url = info.get("url", "")
+        name = info.get("name", key)
+        if not url:
+            lines.append(f"⚠️ *{name}* — no URL configured")
+            continue
+        alive = await _healer._is_alive(url)
+        icon = "✅" if alive else "❌"
+        lines.append(f"{icon} *{name}* — `{url}`")
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="srvchk_refresh"),
+            InlineKeyboardButton("📊 Stats", callback_data="srvchk_stats"),
+        ]
+    ])
+    return "\n".join(lines), keyboard
+
+
+# ── Admin panel button: "📡 Server Status" ──
+async def server_status_admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("🌐 Checking servers...")
+    if not is_admin(update.effective_user.id):
+        await query.message.reply_text("🚫 Admin only command.")
+        return
+    text, keyboard = await _build_server_status_view()
+    await query.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+# ── Refresh button on the server status view ──
+async def srvchk_refresh_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("🔄 Refreshing...")
+    if not is_admin(update.effective_user.id):
+        await query.message.reply_text("🚫 Admin only command.")
+        return
+    text, keyboard = await _build_server_status_view()
+    try:
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    except Exception:
+        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+# ── Stats button on the server status view ──
+async def srvchk_stats_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("📊 Loading stats...")
+    if not is_admin(update.effective_user.id):
+        await query.message.reply_text("🚫 Admin only command.")
+        return
+    if not _healer:
+        await query.message.reply_text("⚠️ Healer not initialized.", parse_mode="Markdown")
+        return
+    servers = load_servers()
+    up = down = 0
+    for key, info in servers.items():
+        url = info.get("url", "")
+        if not url:
+            continue
+        alive = await _healer._is_alive(url)
+        if alive:
+            up += 1
+        else:
+            down += 1
+    total = up + down
+    await query.message.reply_text(
+        f"📊 *SERVER STATS*\n━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Up: `{up}`\n❌ Down: `{down}`\n📦 Total: `{total}`",
+        parse_mode="Markdown",
+    )
+
+
+# ── /checkservers command: manually trigger a live check of all servers ──
+async def checkservers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🚫 Admin only command.")
+        return
+    if not _healer:
+        await update.message.reply_text("⚠️ Healer not initialized.", parse_mode="Markdown")
+        return
+    msg = await update.message.reply_text("🌐 Checking all servers, please wait...")
+    servers = load_servers()
+    lines = ["🌐 *SERVER STATUS*\n━━━━━━━━━━━━━━━━━━"]
+    for key, info in servers.items():
+        url = info.get("url", "")
+        name = info.get("name", key)
+        if not url:
+            lines.append(f"⚠️ *{name}* — no URL configured")
+            continue
+        alive = await _healer._is_alive(url)
+        icon = "✅" if alive else "❌"
+        lines.append(f"{icon} *{name}* — `{url}`")
+    try:
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ── /serverstats command: quick summary counts of up/down servers ──
+async def serverstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🚫 Admin only command.")
+        return
+    if not _healer:
+        await update.message.reply_text("⚠️ Healer not initialized.", parse_mode="Markdown")
+        return
+    servers = load_servers()
+    up = down = 0
+    for key, info in servers.items():
+        url = info.get("url", "")
+        if not url:
+            continue
+        alive = await _healer._is_alive(url)
+        if alive:
+            up += 1
+        else:
+            down += 1
+    total = up + down
+    await update.message.reply_text(
+        f"📊 *SERVER STATS*\n━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Up: `{up}`\n❌ Down: `{down}`\n📦 Total: `{total}`",
+        parse_mode="Markdown",
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════
 #   📦 GROUP FILE INDEX SYSTEM
 #   Bot jis bhi group/channel ka admin hai, wahan uploaded
