@@ -2453,109 +2453,57 @@ async def grp_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── /index_channel command — bulk index existing messages ──
-async def index_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _index_channel_worker(status_msg, target_chat: int, limit: int, source_chat_id: int, bot):
     """
-    /index_channel <chat_id> [limit]
-    Admin command: bulk index existing messages from a group/channel.
-    Default limit: 200 messages.
+    Background worker that scans a group/channel for existing video/document
+    messages and indexes them. Runs as an asyncio task so it never blocks
+    the bot's polling loop or the web service's health checks.
     """
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.", parse_mode="Markdown")
-        return
+    indexed = 0
+    skipped = 0
+    errors  = 0
+    batch   = 0
 
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "❌ *Usage:* `/index_channel CHAT_ID [limit]`\n\n"
-            "Example: `/index_channel -1001234567890 500`\n\n"
-            "Chat ID `GROUP_IDS` env var mein bhi add karo.",
-            parse_mode="Markdown"
-        )
-        return
-
-    try:
-        target_chat = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid chat ID. Numbers mein dena.", parse_mode="Markdown")
-        return
-
-    limit = 200
-    if len(args) >= 2:
-        try:
-            limit = min(int(args[1]), 2000)
-        except ValueError:
-            pass
-
-    status_msg = await update.message.reply_text(
-        f"📦 *Indexing chat* `{target_chat}`\n"
-        f"Limit: `{limit}` messages\n\n"
-        f"_Yeh kuch minutes le sakta hai..._",
-        parse_mode="Markdown"
-    )
-
-    indexed  = 0
-    skipped  = 0
-    errors   = 0
-    msg_id   = 1
-    batch    = 0
-
-    # Telegram mein direct history fetch nahi hota via Bot API
-    # Workaround: forward messages from channel to bot's own chat (if public)
-    # Better approach: use getUpdates history or forwardFrom
-    # We use copyMessage approach — try message IDs sequentially
-    # Get latest message_id first
-    try:
-        chat_info = await context.bot.get_chat(target_chat)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Chat access error: `{e}`\n\nBot ko group ka admin banao.", parse_mode="Markdown")
-        return
-
-    # Try to get recent messages via forwardMessage trick
-    # We'll use a smarter approach: ask user to forward messages OR
-    # use channel's linked group if available
-
-    # Actually best approach for channels: iterate message IDs
-    # We'll try IDs from high to low (guess latest ~10000)
-    # For groups: same approach
-
-    await status_msg.edit_text(
-        f"📦 *Indexing* `{target_chat}`\n"
-        f"_Message IDs scan kar raha hoon..._\n"
-        f"⏳ Progress: `0/{limit}`",
-        parse_mode="Markdown"
-    )
-
-    # Get a rough idea of latest msg_id by trying high numbers
+    # Get a rough idea of the latest msg_id by probing a few high numbers
     latest_id = 1
     for probe in [9999, 4999, 1999, 999, 499, 199, 99]:
         try:
-            fwd = await context.bot.forward_message(
-                chat_id=update.effective_chat.id,
-                from_chat_id=target_chat,
-                message_id=probe,
-                disable_notification=True,
+            fwd = await asyncio.wait_for(
+                bot.forward_message(
+                    chat_id=source_chat_id,
+                    from_chat_id=target_chat,
+                    message_id=probe,
+                    disable_notification=True,
+                ),
+                timeout=10,
             )
             latest_id = max(latest_id, probe)
-            try: await fwd.delete()
-            except: pass
+            try:
+                await fwd.delete()
+            except Exception:
+                pass
             break
         except Exception:
             pass
 
-    # Scan from latest downward
     scanned  = 0
     check_id = latest_id
+    consecutive_not_found = 0
+
     while scanned < limit and check_id > 0:
         try:
-            fwd = await context.bot.forward_message(
-                chat_id=update.effective_chat.id,
-                from_chat_id=target_chat,
-                message_id=check_id,
-                disable_notification=True,
+            fwd = await asyncio.wait_for(
+                bot.forward_message(
+                    chat_id=source_chat_id,
+                    from_chat_id=target_chat,
+                    message_id=check_id,
+                    disable_notification=True,
+                ),
+                timeout=10,
             )
-            # Check if it's a video/document
+            consecutive_not_found = 0
+
             if fwd.video or fwd.document:
-                # Reconstruct a fake message-like object for grp_index_message
                 caption = fwd.caption or ""
                 if not caption and fwd.document:
                     caption = getattr(fwd.document, "file_name", "") or ""
@@ -2564,8 +2512,6 @@ async def index_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parsed    = _parse_caption(caption)
                     raw_title = parsed["clean_title"]
 
-                    # Same AI-smart structured extraction used for live uploads,
-                    # so bulk-backfilled old files get identical treatment.
                     ai_info      = await _ai_extract_title_info(caption, parsed)
                     clean_title  = (ai_info["clean_title"] or raw_title).lower().strip()
                     final_year   = ai_info["year"] or parsed["year"]
@@ -2610,13 +2556,24 @@ async def index_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         skipped += 1
                 else:
                     skipped += 1
-            try: await fwd.delete()
-            except: pass
+            try:
+                await fwd.delete()
+            except Exception:
+                pass
 
+        except asyncio.TimeoutError:
+            errors += 1
+            if errors > 20:
+                break
         except Exception as e:
             err_str = str(e).lower()
             if "message to forward not found" in err_str or "invalid" in err_str:
-                pass  # message doesn't exist at this ID
+                consecutive_not_found += 1
+                # Long stretch of missing IDs usually means we've scanned
+                # past the start of the chat's history — stop early instead
+                # of burning through the rest of the ID range one by one.
+                if consecutive_not_found > 200:
+                    break
             else:
                 errors += 1
                 if errors > 20:
@@ -2635,17 +2592,73 @@ async def index_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ Indexed: `{indexed}` | ⏩ Skipped: `{skipped}`",
                     parse_mode="Markdown"
                 )
-            except: pass
+            except Exception:
+                pass
             await asyncio.sleep(0.5)
 
-    await status_msg.edit_text(
-        f"✅ *Index Complete!*\n\n"
-        f"📦 Chat: `{target_chat}`\n"
-        f"✅ Indexed: `{indexed}` files\n"
-        f"⏩ Skipped: `{skipped}`\n"
-        f"❌ Errors: `{errors}`\n\n"
-        f"_Ab users movie search karenge toh direct link milega!_",
+    try:
+        await status_msg.edit_text(
+            f"✅ *Index Complete!*\n\n"
+            f"📦 Chat: `{target_chat}`\n"
+            f"✅ Indexed: `{indexed}` files\n"
+            f"⏩ Skipped: `{skipped}`\n"
+            f"❌ Errors: `{errors}`\n\n"
+            f"_Ab users movie search karenge toh direct link milega!_",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+
+async def index_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /index_channel <chat_id> [limit]
+    Admin command: bulk index existing messages from a group/channel.
+    Default limit: 200 messages. Runs as a background task so it never
+    blocks the bot's polling loop or the web service's health checks.
+    """
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.", parse_mode="Markdown")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "❌ *Usage:* `/index_channel CHAT_ID [limit]`\n\n"
+            "Example: `/index_channel -1001234567890 500`\n\n"
+            "Chat ID `GROUP_IDS` env var mein bhi add karo.",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        target_chat = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid chat ID. Numbers mein dena.", parse_mode="Markdown")
+        return
+
+    limit = 200
+    if len(args) >= 2:
+        try:
+            limit = min(int(args[1]), 2000)
+        except ValueError:
+            pass
+
+    try:
+        await context.bot.get_chat(target_chat)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Chat access error: `{e}`\n\nBot ko group ka admin banao.", parse_mode="Markdown")
+        return
+
+    status_msg = await update.message.reply_text(
+        f"📦 *Indexing chat* `{target_chat}`\n"
+        f"Limit: `{limit}` messages\n\n"
+        f"_Background mein chal raha hai, bot normal kaam karta rahega..._",
         parse_mode="Markdown"
+    )
+
+    asyncio.create_task(
+        _index_channel_worker(status_msg, target_chat, limit, update.effective_chat.id, context.bot)
     )
 
 
