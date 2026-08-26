@@ -6,6 +6,7 @@ import random
 import logging
 import sqlite3
 import threading
+import http.server
 import asyncio
 import traceback
 import calendar
@@ -308,6 +309,14 @@ async def auto_delete(msg, delay=60, user_data=None, key=None):
 # ═══════════════════════════════════════════════════════════════════
 #                  ANIMATIONS
 # ═══════════════════════════════════════════════════════════════════
+def _text_bar(value, max_value, width=10):
+    """Tiny dependency-free bar chart using block characters — keeps the
+    analytics dashboard visual without needing matplotlib on Render."""
+    if max_value <= 0:
+        return "░" * width
+    filled = max(0, min(width, int(round((value / max_value) * width))))
+    return "█" * filled + "░" * (width - filled)
+
 def progress_bar(current, total, length=10):
     if total == 0: return "[··········] 0%"
     filled = int(length * current / total)
@@ -367,9 +376,10 @@ def get_badge(points):
 
 def build_star_bar(rating):
     try:
-        s = int(float(rating))
-        return "⭐" * s + "☆" * (10 - s)
-    except: return "☆☆☆☆☆☆☆☆☆☆"
+        r5 = int(float(rating) / 2.0 + 0.5)  # /10 → /5 scale, round-half-up
+        r5 = max(0, min(5, r5))
+        return "⭐" * r5 + "☆" * (5 - r5)
+    except: return "☆☆☆☆☆"
 
 def get_omdb(title, by_id=False):
     try:
@@ -506,6 +516,26 @@ async def ai_recommend(query: str) -> Optional[str]:
     return await ai_ask(
         f"You are a movie expert. {query}\nGive exactly 5 recommendations.\n"
         "Format: 🎬 Title (Year) — One line reason\nBe concise. Reply in same language as query."
+    )
+
+async def ai_personalized_recommend(history_titles: list, loved_titles: list, watchlist_titles: list) -> Optional[str]:
+    seen  = ", ".join(history_titles[:10]) if history_titles else "none yet"
+    loved = ", ".join(loved_titles[:5])     if loved_titles   else "none yet"
+    saved = ", ".join(watchlist_titles[:5]) if watchlist_titles else "none yet"
+    exclude = list(dict.fromkeys(history_titles + watchlist_titles))
+    exclude_str = ", ".join(exclude[:15]) if exclude else "none"
+    return await ai_ask(
+        "You are a movie recommendation expert building a personalized list "
+        "for one specific user based on their real activity on a movie app.\n\n"
+        f"Recently searched (taste signal, most recent first): {seen}\n"
+        f"Rated 4-5 stars by this user (loved): {loved}\n"
+        f"Currently on their watchlist: {saved}\n\n"
+        f"Give exactly 5 NEW recommendations this user hasn't already searched "
+        f"or saved (do not repeat any of: {exclude_str}). Base the picks on the "
+        "pattern in their taste, not generic popularity.\n"
+        "Format: 🎬 Title (Year) — one line tying it to their taste\n"
+        "Be concise. Reply in Hinglish (mix Hindi-English).",
+        max_tokens=400,
     )
 
 async def ai_plot_search(plot_desc: str) -> Optional[str]:
@@ -880,7 +910,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"└─────────────────────┘\n\n"
         f"🔎 *Movie dhundhna ho?*\n"
         f"_Seedha movie ka naam type karo!_\n\n"
-        f"🔧 *Domain Healer v4 Active*\n"
+        f"🔧 *Domain Healer v7 Active*\n"
         f"_Sites auto-heal hoti hain!_\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━",
         parse_mode="Markdown",
@@ -1038,14 +1068,11 @@ async def _send_movie_card(update, context, data, reply_to=None, is_search=False
         f"   {genre_icons}  *{title.upper()}*  `{year}`\n"
         f"╚═══════════════════╝\n"
         f"{tagline_line}"
-        f"{star_bar}\n"
-        f"⭐ *IMDb:* `{rating}/10`   🍅 *RT:* `{rt_score}`\n"
+        f"{star_bar}  *{rating}*/10 IMDb  •  🍅 {rt_score}\n"
         f"👥 *Community:* {comm_rat}\n"
         f"🗳 *Votes:* `{votes}`   🔞 *Rated:* `{rated}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎭 *Genre:*    `{genre}`\n"
-        f"⏱ *Runtime:* `{runtime}`\n"
-        f"🌍 *Lang:*     `{language}`\n"
+        f"🎭 `{genre}`  ⏱ `{runtime}`  🌍 `{language}`\n"
         f"🎥 *Director:* `{director}`\n"
         f"👥 *Cast:*     `{actors}`\n"
         f"💰 *Box Office:* `{boxoff}`\n"
@@ -1388,15 +1415,25 @@ async def trivia_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#   🔧 DOMAIN HEALER V6 — AI-POWERED SERVER LINK FINDER
+#   🔧 DOMAIN HEALER V7 — AI-POWERED SERVER LINK FINDER (accuracy pass)
 #   Har server periodically check hota hai (live/down).
-#   Down milne par: AI suggestion + Web search dono se candidate
-#   domains nikalte hain, phir HAR candidate ko actually HTTP request
-#   karke verify karte hain (real load test, sirf suggestion nahi).
-#   v6: winning candidate ab ek FINAL independent AI double-check se
-#   guzarta hai (real page content padh ke) — ye ek extra confidence
-#   layer hai jo look-alike/spam domains ko admin tak pahunchne se
-#   pehle hi filter kar deta hai.
+#   Down milne par: AI suggestion + Web search (3 query variants) dono se
+#   candidate domains nikalte hain, phir HAR candidate ko actually HTTP
+#   request karke verify karte hain (real load test, sirf suggestion nahi).
+#   v6: winning candidate ek FINAL independent AI double-check se guzarta
+#   hai (real page content padh ke) — extra confidence layer jo look-alike/
+#   spam domains ko admin tak pahunchne se pehle hi filter kar deta hai.
+#   v7 additions:
+#     • Hard safety gate — gambling/adult/phishing/parked markers par
+#       candidate turant 0 score, chahe baaki signals kitne bhi strong ho.
+#     • LIVE search test — candidate par asli movie search chala ke dekhte
+#       hain ki real listings aati hain ya nahi (sabse strong signal).
+#     • Title-tag + content-vocabulary matching add hua.
+#     • Pehle se rejected domains dobara suggest nahi hote (30-din window).
+#     • Pure-AI-recall (uncorroborated) guess ka score hard-capped hai jab
+#       tak live test khud pass na kare — LLM ki "yaad" hamesha sahi nahi.
+#     • Weak matches (score < HEALER_MIN_CONFIDENCE) admin tak jaate hi
+#       nahi — jo bhi approval maangi jaaye woh high-confidence ho.
 #   Sabse best-scoring verified candidate admin ko approval ke liye
 #   bheja jaata hai. Approve hote hi live servers.json update hota hai.
 # ═══════════════════════════════════════════════════════════════════
@@ -1469,6 +1506,13 @@ def _healer_init_db():
             );
         """)
         con.commit()
+        # Migration: older DBs (pre-multi-candidate approval) won't have this
+        # column yet — add it in place so a redeploy doesn't lose heal_log
+        # history or require dropping the existing pending_heals table.
+        cols = [r[1] for r in con.execute("PRAGMA table_info(pending_heals)").fetchall()]
+        if "candidates_json" not in cols:
+            con.execute("ALTER TABLE pending_heals ADD COLUMN candidates_json TEXT")
+            con.commit()
         con.close()
 
 _healer_init_db()
@@ -1493,6 +1537,39 @@ def _healer_db_fetch(query: str, params: tuple = ()) -> list:
             return [dict(zip(cols, row)) for row in cur.fetchall()]
         finally:
             con.close()
+
+
+# Bad-content markers: expired/hijacked domains commonly get sniped and
+# repointed at parking pages, gambling, adult, or phishing content. Any of
+# these on a candidate page is an automatic disqualification — and on an
+# already-live server it means "down" even if the HTTP status looks fine.
+_HEALER_BAD_MARKERS = [
+    # parked / for-sale
+    "domain is for sale", "buy this domain", "domain parking",
+    "this domain may be for sale", "godaddy.com/domainsearch",
+    "backorder this domain", "make an offer on this domain",
+    # gambling — a very common expired-domain squat target
+    "online casino", "bet now", "betting odds", "welcome bonus 100%",
+    "play now win real money", "register now to claim your bonus",
+    # adult content
+    "18+ only", "adults only content", "escort service",
+    # phishing / malware / scam
+    "your device has been locked", "you have won a prize",
+    "verify your account to continue", "your computer is infected",
+]
+
+# Vocabulary typical of a movie-download/streaming site — a soft relevance
+# signal alongside the domain-name and title checks.
+_MOVIE_SITE_KEYWORDS = [
+    "download", "watch online", "hdrip", "web-dl", "webrip", "bluray",
+    "480p", "720p", "1080p", "dual audio", "hindi dubbed", "subtitles",
+    "full movie", "web series", "season", "episode",
+]
+
+# Candidates scoring below this never reach the admin — keeps /healerlog
+# approvals meaningfully close to "almost certainly correct" instead of
+# forwarding every weak guess.
+HEALER_MIN_CONFIDENCE = 45.0
 
 
 class HealerV4:
@@ -1567,15 +1644,29 @@ class HealerV4:
                     # A domain-parked / "for sale" page often still returns 200 —
                     # sniff a bit of body text to rule those out.
                     body = (await resp.text(errors="ignore"))[:4000].lower()
-                    parked_markers = [
-                        "domain is for sale", "buy this domain", "domain parking",
-                        "this domain may be for sale", "godaddy.com/domainsearch",
-                    ]
-                    if any(m in body for m in parked_markers):
+                    if any(m in body for m in _HEALER_BAD_MARKERS):
                         return False
                     return True
         except Exception:
             return False
+
+    # ── Domains already rejected for this server recently — don't resurface ──
+    def _get_rejected_domains(self, key: str, days: int = 30) -> set:
+        cutoff = time.time() - (days * 86400)
+        rows = _healer_db_fetch(
+            "SELECT new_url FROM heal_log WHERE server_key=? "
+            "AND status IN ('rejected','ai_rejected') AND created_at >= ?",
+            (key, cutoff),
+        )
+        domains = set()
+        for r in rows:
+            u = r.get("new_url")
+            if u:
+                try:
+                    domains.add(urlparse(u).netloc.lower())
+                except Exception:
+                    pass
+        return domains
 
     # ── Full heal pipeline for one server ──
     async def heal_server(self, key: str, name: str, old_url: str):
@@ -1585,6 +1676,14 @@ class HealerV4:
         ai_candidates     = await self._find_via_ai(name, base_domain)
         search_candidates = await self._find_via_search(name, base_domain)
         all_candidates     = list(dict.fromkeys(ai_candidates + search_candidates))  # dedupe, keep order
+
+        # Drop anything the admin already rejected for this server recently —
+        # no point re-verifying (or re-pinging the admin about) the same
+        # wrong domain twice.
+        already_rejected = self._get_rejected_domains(key)
+        if already_rejected:
+            all_candidates = [c for c in all_candidates
+                               if urlparse(c).netloc.lower() not in already_rejected]
 
         if not all_candidates:
             print(f"❌ [Healer] No candidates found for {name}")
@@ -1605,27 +1704,43 @@ class HealerV4:
             self._log(key, name, old_url, None, "none", 0.0, "verification_failed")
             return
 
-        # 3) Pick the best-scoring verified candidate
+        # 3) Rank all verified candidates and keep the top few for the admin
         scored.sort(key=lambda x: x[1], reverse=True)
-        best_url, best_score, best_source, best_snippet = scored[0]
+        shortlist = scored[:3]
 
-        # 4) Final independent AI double-check pass — reads the actual page
-        #    content and gives one more confidence signal before this ever
-        #    reaches the admin, catching cases where the heuristic score
-        #    was fooled by a look-alike or unrelated site.
-        ai_confidence = await self._ai_double_check(name, old_url, best_url, best_snippet)
-        # Blend: heuristic score (0-100) stays dominant, AI opinion adjusts it
-        final_score = min(100.0, (best_score * 0.7) + (ai_confidence * 100 * 0.3))
+        # 4) Final independent AI double-check pass on each shortlisted
+        #    candidate — reads the actual page content and gives one more
+        #    confidence signal before anything reaches the admin, catching
+        #    cases where the heuristic score was fooled by a look-alike.
+        ranked = []
+        for cand_url, heur_score, source_tag, snippet in shortlist:
+            ai_confidence = await self._ai_double_check(name, old_url, cand_url, snippet)
+            # Blend: heuristic score (0-100) stays dominant, AI opinion adjusts it
+            final_score = min(100.0, (heur_score * 0.7) + (ai_confidence * 100 * 0.3))
+            if ai_confidence < 0.25:
+                # AI is fairly confident this one is NOT the right site — drop
+                # it from the shortlist instead of showing it to the admin.
+                print(f"❌ [Healer] AI double-check rejected {cand_url} for {name} (conf {ai_confidence:.2f})")
+                self._log(key, name, old_url, cand_url, source_tag, final_score, "ai_rejected")
+                continue
+            ranked.append((cand_url, source_tag, final_score))
 
-        if ai_confidence < 0.25:
-            # AI is fairly confident this is NOT the right site — don't waste
-            # the admin's time, log it and stop instead of forwarding a bad match.
-            print(f"❌ [Healer] AI double-check rejected {best_url} for {name} (conf {ai_confidence:.2f})")
-            self._log(key, name, old_url, best_url, best_source, final_score, "ai_rejected")
+        if not ranked:
+            print(f"❌ [Healer] {name}: every shortlisted candidate failed the AI double-check")
             return
 
-        # 5) Send to admin for approval before going live
-        await self._request_approval(key, name, old_url, best_url, best_source, final_score)
+        ranked.sort(key=lambda x: x[2], reverse=True)
+
+        if ranked[0][2] < HEALER_MIN_CONFIDENCE:
+            # Below our bar for bothering the admin at all — logged so it's
+            # visible in /healerlog, but nothing is sent. Keeps the admin's
+            # approvals meaningfully close to "almost certainly correct."
+            print(f"⚠️ [Healer] {name}: best candidate scored too low ({ranked[0][2]:.0f}) — not notifying admin")
+            self._log(key, name, old_url, ranked[0][0], ranked[0][1], ranked[0][2], "low_confidence_skip")
+            return
+
+        # 5) Send admin the ranked shortlist (top 1-3) for approval
+        await self._request_approval(key, name, old_url, ranked)
 
 
     # ── Source A: Groq AI suggestion ──
@@ -1635,9 +1750,12 @@ class HealerV4:
         prompt = (
             f"The website '{name}' (previously at domain '{base_domain}') "
             f"appears to be down or has changed its domain. "
-            f"This is a movie-download search-engine style site. "
-            f"List up to 3 likely CURRENT working domain names for this exact "
-            f"site (same site, possibly a new TLD or subdomain change). "
+            f"This is a movie-download search-engine style site — these sites "
+            f"commonly reappear at the same name with a different TLD or a "
+            f"numeral/prefix change (e.g. a '.mov'/'.sb'/'.fo' swap, or 'new1.' "
+            f"prepended). If you are not genuinely confident of a real, "
+            f"currently-working domain, it is fine to return fewer guesses "
+            f"rather than invent one. List up to 3 candidates. "
             f"Return ONLY a comma-separated list of full https:// URLs, nothing else."
         )
         try:
@@ -1650,10 +1768,10 @@ class HealerV4:
             print(f"⚠️ [Healer] AI candidate search failed: {e}")
             return []
 
-    # ── Source B: Web search (DuckDuckGo HTML — no API key needed) ──
-    async def _find_via_search(self, name: str, base_domain: str) -> list:
-        query = quote(f"{name} official site")
-        search_url = f"https://duckduckgo.com/html/?q={query}"
+    # ── Raw DDG HTML search: returns raw href list for one query ──
+    async def _ddg_search_raw(self, query: str) -> list:
+        q = quote(query)
+        search_url = f"https://duckduckgo.com/html/?q={q}"
         try:
             timeout = aiohttp.ClientTimeout(total=12)
             async with aiohttp.ClientSession(timeout=timeout) as sess:
@@ -1661,53 +1779,103 @@ class HealerV4:
                     if resp.status != 200:
                         return []
                     html = await resp.text(errors="ignore")
-            if not _BS4_AVAILABLE:
-                # Fallback: crude regex extraction if bs4 isn't available
-                raw_links = re.findall(r'href="(https?://[^"]+)"', html)
-            else:
-                soup = BeautifulSoup(html, "html.parser")
-                raw_links = [a.get("href", "") for a in soup.select("a.result__a")]
-                if not raw_links:
-                    raw_links = [a.get("href", "") for a in soup.select("a[href^='http']")]
-
-            candidates = []
-            skip_domains = {"duckduckgo.com", "google.com", "bing.com", "facebook.com", "twitter.com", "youtube.com"}
-            for link in raw_links[:15]:
-                netloc = urlparse(link).netloc.lower()
-                if not netloc or any(s in netloc for s in skip_domains):
-                    continue
-                candidates.append(link)
-                if len(candidates) >= 3:
-                    break
-            return candidates
         except Exception as e:
-            print(f"⚠️ [Healer] Web search failed: {e}")
+            print(f"⚠️ [Healer] Web search failed ({query!r}): {e}")
             return []
 
-    # ── Verify one candidate: real request + name-relevance scoring ──
+        if not _BS4_AVAILABLE:
+            # Fallback: crude regex extraction if bs4 isn't available
+            return re.findall(r'href="(https?://[^"]+)"', html)
+        soup = BeautifulSoup(html, "html.parser")
+        raw_links = [a.get("href", "") for a in soup.select("a.result__a")]
+        if not raw_links:
+            raw_links = [a.get("href", "") for a in soup.select("a[href^='http']")]
+        return raw_links
+
+    # ── Source B: Web search across a few query variants (DuckDuckGo HTML —
+    #    no API key needed). These mirror sites rarely have a clean "official
+    #    site" footprint, so one phrasing alone misses a lot — a few variants
+    #    widen the net considerably. ──
+    async def _find_via_search(self, name: str, base_domain: str) -> list:
+        queries = [
+            f"{name} official site",
+            f"{name} new domain",
+            f"{name} alternative link",
+        ]
+        skip_domains = {"duckduckgo.com", "google.com", "bing.com", "facebook.com",
+                         "twitter.com", "youtube.com", "reddit.com", "wikipedia.org"}
+        seen_netlocs = set()
+        candidates = []
+        for q in queries:
+            raw_links = await self._ddg_search_raw(q)
+            for link in raw_links[:15]:
+                netloc = urlparse(link).netloc.lower()
+                if not netloc or netloc in seen_netlocs or any(s in netloc for s in skip_domains):
+                    continue
+                seen_netlocs.add(netloc)
+                candidates.append(link)
+                if len(candidates) >= 5:
+                    return candidates
+        return candidates
+
+    # ── Strongest relevance test: does a real search on this candidate
+    #    actually return plausible movie-listing results? Reuses the same
+    #    selectors the bot's own search feature relies on, so a pass here
+    #    means the bot's normal /search flow will likely work too — not
+    #    just that the homepage looks similar. ──
+    async def _test_search_capability(self, url: str) -> bool:
+        test_url = build_search_url(url, "movie")
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.get(test_url, headers=_get_srv_headers(), ssl=False) as resp:
+                    if resp.status not in SRV_UP_CODES:
+                        return False
+                    body = (await resp.text(errors="ignore"))[:8000]
+        except Exception:
+            return False
+
+        if _BS4_AVAILABLE:
+            try:
+                soup = BeautifulSoup(body, "html.parser")
+                hits = 0
+                for sel in _MOVIE_LINK_SELECTORS:
+                    hits += len(soup.select(sel))
+                    if hits >= 3:
+                        return True
+                return hits >= 2
+            except Exception:
+                pass
+        # Fallback without bs4: crude pattern count
+        hits = len(re.findall(r'href="[^"]*(?:download|movie|watch)[^"]*"', body, re.IGNORECASE))
+        return hits >= 3
+
+    # ── Verify one candidate: real request + safety/relevance scoring ──
     async def _verify_candidate(self, url: str, expected_name: str,
                                  ai_list: list, search_list: list) -> tuple:
         alive = await self._is_alive(url, timeout_sec=8)
         if not alive:
             return 0.0, "dead", ""
 
-        score = 40.0  # base score for being alive at all
+        score = 25.0  # base score for being alive at all
         page_snippet = ""
+        body_lower = ""
 
-        # Bonus: domain name resembles the expected site name
         netloc = urlparse(url).netloc.lower()
         name_tokens = [t for t in re.findall(r'[a-z0-9]+', expected_name.lower()) if len(t) > 2]
-        if name_tokens and any(t in netloc for t in name_tokens):
-            score += 30.0
 
-        # Bonus: cross-source agreement (both AI and search suggested the same domain)
+        # Bonus: domain name resembles the expected site name
+        if name_tokens and any(t in netloc for t in name_tokens):
+            score += 20.0
+
+        # Cross-source agreement (both AI and search suggested the same domain)
         in_ai     = any(urlparse(c).netloc.lower() == netloc for c in ai_list)
         in_search = any(urlparse(c).netloc.lower() == netloc for c in search_list)
         source_tag = "ai+search" if (in_ai and in_search) else ("ai" if in_ai else "search")
         if in_ai and in_search:
-            score += 25.0
+            score += 15.0
 
-        # Bonus: homepage actually contains a search box (typical of these sites)
+        # Fetch the homepage once for content-based signals
         try:
             timeout = aiohttp.ClientTimeout(total=8)
             async with aiohttp.ClientSession(timeout=timeout) as sess:
@@ -1715,10 +1883,45 @@ class HealerV4:
                     body = (await resp.text(errors="ignore"))[:6000]
                     page_snippet = body[:1500]  # kept for the AI double-check pass later
                     body_lower = body.lower()
-                    if "<form" in body_lower and ("search" in body_lower or "?s=" in body_lower):
-                        score += 5.0
         except Exception:
             pass
+
+        # Hard safety/quality gate: hijacked/parked/scam domains are rejected
+        # outright regardless of how well other signals score — expired
+        # domains on this kind of site are a common squatting target.
+        if body_lower and any(m in body_lower for m in _HEALER_BAD_MARKERS):
+            return 0.0, "unsafe", ""
+
+        if body_lower:
+            # Bonus: search box present (typical of these sites)
+            if "<form" in body_lower and ("search" in body_lower or "?s=" in body_lower):
+                score += 5.0
+
+            # Bonus: <title> mentions the expected site name
+            title_match = re.search(r'<title[^>]*>(.*?)</title>', body, re.IGNORECASE | re.DOTALL)
+            if title_match and name_tokens:
+                title_lower = title_match.group(1).lower()
+                if any(t in title_lower for t in name_tokens):
+                    score += 10.0
+
+            # Bonus: page vocabulary matches a movie/download site
+            kw_hits = sum(1 for kw in _MOVIE_SITE_KEYWORDS if kw in body_lower)
+            if kw_hits >= 4:
+                score += 10.0
+            elif kw_hits >= 2:
+                score += 5.0
+
+        # Strongest signal: actually run a test search on the candidate.
+        can_search = await self._test_search_capability(url)
+        if can_search:
+            score += 25.0
+
+        # An AI-recall-only guess (not corroborated by search, not proven by
+        # the live test above) is the least trustworthy source — the model
+        # can name a domain confidently while being stale or simply wrong.
+        # Cap it hard unless it independently proves itself via the test.
+        if source_tag == "ai" and not can_search:
+            score = min(score, 30.0)
 
         return min(score, 100.0), source_tag, page_snippet
 
@@ -1737,9 +1940,10 @@ class HealerV4:
             f"'''{page_snippet[:1200]}'''\n\n"
             "Based on this snippet, does this genuinely look like the same "
             "movie-download site (same branding, same type of content, same "
-            "kind of layout) rather than an unrelated site or a parked/spam "
-            "page? Respond with ONLY a number 0.0-1.0 for your confidence, "
-            "nothing else."
+            "kind of layout) rather than an unrelated site, a parked/spam "
+            "page, or a hijacked domain now showing gambling, adult, or "
+            "phishing content? Respond with ONLY a number 0.0-1.0 for your "
+            "confidence, nothing else."
         )
         try:
             result = await ai_ask(prompt, max_tokens=10)
@@ -1751,76 +1955,93 @@ class HealerV4:
             print(f"⚠️ [Healer] AI double-check failed: {e}")
         return 0.5
 
-    # ── Send an approval request to the admin ──
-    async def _request_approval(self, key, name, old_url, new_url, source, score):
+    # ── Send an approval request to the admin, showing the ranked shortlist ──
+    async def _request_approval(self, key, name, old_url, ranked: list):
+        """ranked: list of (candidate_url, source, score) tuples, best first, up to 3."""
+        options = [{"url": u, "source": s, "score": sc} for (u, s, sc) in ranked]
         _healer_db_execute(
             """INSERT INTO pending_heals
-               (server_key, server_name, old_url, candidate_url, source, confidence, created_at)
-               VALUES (?,?,?,?,?,?,?)
+               (server_key, server_name, old_url, candidate_url, source, confidence, candidates_json, created_at)
+               VALUES (?,?,?,?,?,?,?,?)
                ON CONFLICT(server_key) DO UPDATE SET
                  candidate_url=excluded.candidate_url,
                  source=excluded.source,
                  confidence=excluded.confidence,
+                 candidates_json=excluded.candidates_json,
                  created_at=excluded.created_at""",
-            (key, name, old_url, new_url, source, score, time.time()),
+            (key, name, old_url, ranked[0][0], ranked[0][1], ranked[0][2],
+             json.dumps(options), time.time()),
         )
 
         if not self.admin_id or not self.bot:
             return
 
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Approve", callback_data=f"heal_approve_{key}"),
-             InlineKeyboardButton("❌ Reject",  callback_data=f"heal_reject_{key}")],
+        lines = [f"🔧 *Domain Healer — {name} down*\n", f"🔴 Old: `{old_url}`"]
+        option_rows = []
+        for i, (u, s, sc) in enumerate(ranked, start=1):
+            lines.append(f"\n*Option {i}:* `{u}`\n📡 `{s}` · 🎯 `{sc:.0f}%`")
+            option_rows.append([InlineKeyboardButton(f"✅ Use #{i} ({sc:.0f}%)", callback_data=f"heal_approve_{key}_{i-1}")])
+        text = "\n".join(lines) + "\n\n_Ek option approve karo taaki live update ho._"
+
+        kb = InlineKeyboardMarkup(option_rows + [
+            [InlineKeyboardButton("❌ None of these", callback_data=f"heal_reject_{key}")],
         ])
         try:
             await self.bot.send_message(
-                chat_id=self.admin_id,
-                text=(
-                    f"🔧 *Domain Healer — {name} down*\n\n"
-                    f"🔴 Old: `{old_url}`\n"
-                    f"🟢 New candidate: `{new_url}`\n"
-                    f"📡 Source: `{source}`\n"
-                    f"🎯 Confidence: `{score:.0f}%`\n\n"
-                    f"_Approve karo taaki live update ho._"
-                ),
-                parse_mode="Markdown",
-                reply_markup=kb,
+                chat_id=self.admin_id, text=text, parse_mode="Markdown", reply_markup=kb,
             )
         except Exception as e:
             print(f"⚠️ [Healer] Could not notify admin: {e}")
 
-    # ── Admin tapped Approve ──
+    # ── Admin tapped one of the "Use #N" options ──
     async def _approve_cb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         if not is_admin(query.from_user.id):
             await query.answer("🚫 Admin only.", show_alert=True)
             return
-        key = query.data.replace("heal_approve_", "")
+        payload = query.data.replace("heal_approve_", "")
+        key, _, idx_str = payload.rpartition("_")
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            key, idx = payload, 0
+
         rows = _healer_db_fetch("SELECT * FROM pending_heals WHERE server_key=?", (key,))
         if not rows:
             await query.answer("⚠️ Ye request expire ho gayi.", show_alert=True)
             return
         row = rows[0]
 
+        chosen_url, chosen_source, chosen_score = row["candidate_url"], row["source"], row["confidence"]
+        if row.get("candidates_json"):
+            try:
+                options = json.loads(row["candidates_json"])
+                if 0 <= idx < len(options):
+                    chosen_url    = options[idx]["url"]
+                    chosen_source = options[idx]["source"]
+                    chosen_score  = options[idx]["score"]
+            except Exception:
+                pass
+
         servers = load_servers()
         if key in servers:
-            servers[key]["url"] = row["candidate_url"]
+            servers[key]["url"] = chosen_url
             save_json("servers", servers)
 
-        self._log(key, row["server_name"], row["old_url"], row["candidate_url"],
-                   row["source"], row["confidence"], "approved")
+        self._log(key, row["server_name"], row["old_url"], chosen_url,
+                   chosen_source, chosen_score, "approved")
         _healer_db_execute("DELETE FROM pending_heals WHERE server_key=?", (key,))
 
         await query.answer("✅ Applied!")
         try:
             await query.message.edit_text(
-                f"✅ *Healed!*\n\n{row['server_name']} → `{row['candidate_url']}`",
+                f"✅ *Healed!*\n\n{row['server_name']} → `{chosen_url}`",
                 parse_mode="Markdown",
             )
         except Exception:
             pass
 
-    # ── Admin tapped Reject ──
+    # ── Admin tapped "None of these" ──
     async def _reject_cb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         if not is_admin(query.from_user.id):
@@ -1830,8 +2051,18 @@ class HealerV4:
         rows = _healer_db_fetch("SELECT * FROM pending_heals WHERE server_key=?", (key,))
         if rows:
             row = rows[0]
-            self._log(key, row["server_name"], row["old_url"], row["candidate_url"],
-                       row["source"], row["confidence"], "rejected")
+            logged_any = False
+            if row.get("candidates_json"):
+                try:
+                    for opt in json.loads(row["candidates_json"]):
+                        self._log(key, row["server_name"], row["old_url"], opt["url"],
+                                   opt.get("source", ""), opt.get("score", 0.0), "rejected")
+                        logged_any = True
+                except Exception:
+                    pass
+            if not logged_any:
+                self._log(key, row["server_name"], row["old_url"], row["candidate_url"],
+                           row["source"], row["confidence"], "rejected")
         _healer_db_execute("DELETE FROM pending_heals WHERE server_key=?", (key,))
         await query.answer("❌ Rejected.")
         try:
@@ -1875,7 +2106,7 @@ async def healerlog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not log:
         await update.message.reply_text("📋 *Healer History*\n\n_Abhi tak koi heal nahi hua._", parse_mode="Markdown")
         return
-    lines = ["📋 *HEALER v6 HISTORY* (last 10)\n━━━━━━━━━━━━━━━━━━"]
+    lines = ["📋 *HEALER v7 HISTORY* (last 10)\n━━━━━━━━━━━━━━━━━━"]
     for row in log:
         ts = datetime.fromtimestamp(row["created_at"]).strftime("%d %b, %H:%M") if row.get("created_at") else "?"
         status_icon = {"approved": "✅", "rejected": "❌", "no_candidates": "⚠️", "verification_failed": "⚠️", "ai_rejected": "🤖❌"}.get(row["status"], "❔")
@@ -2016,6 +2247,99 @@ async def serverstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Up: `{up}`\n❌ Down: `{down}`\n📦 Total: `{total}`",
         parse_mode="Markdown",
     )
+
+
+async def analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        if update.callback_query:
+            await update.callback_query.answer("🚫 Admin only.", show_alert=True)
+        else:
+            await update.message.reply_text("🚫 Admin only command.")
+        return
+    if update.callback_query:
+        await update.callback_query.answer()
+        msg = update.callback_query.message
+    else:
+        msg = update.message
+
+    users = load_json("users")
+    total_users = len(users)
+    today = today_ist()
+    week_ago = today - timedelta(days=7)
+    new_today = new_week = 0
+    for u in users.values():
+        try:
+            jdate = datetime.strptime(u.get("joined", "")[:10], "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if jdate == today:
+            new_today += 1
+        if jdate >= week_ago:
+            new_week += 1
+
+    searches = load_json("searches")
+    total_searches = sum(searches.values())
+    top5 = sorted(searches.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    logs = load_json("logs")
+    day_counts = []
+    for i in range(6, -1, -1):
+        d = today - timedelta(days=i)
+        day_counts.append((d.strftime("%a"), len(logs.get(str(d), []))))
+    max_day = max((c for _, c in day_counts), default=0)
+
+    total_watchlist = sum(len(v) for v in load_json("watchlist").values())
+
+    heal_stats = {"approved": 0, "rejected": 0, "low_confidence_skip": 0}
+    if _healer:
+        cutoff = time.time() - (30 * 86400)
+        rows = _healer_db_fetch(
+            "SELECT status, COUNT(*) as cnt FROM heal_log WHERE created_at >= ? GROUP BY status",
+            (cutoff,),
+        )
+        for r in rows:
+            if r["status"] in heal_stats:
+                heal_stats[r["status"]] = r["cnt"]
+
+    up_n = down_n = 0
+    if _healer:
+        for info in load_servers().values():
+            url = info.get("url", "")
+            if not url:
+                continue
+            if await _healer._is_alive(url):
+                up_n += 1
+            else:
+                down_n += 1
+
+    lines = [
+        "📊 *ANALYTICS DASHBOARD*",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"👥 *Users:* `{total_users}` _(+{new_today} today, +{new_week} this week)_",
+        f"🔎 *Total Searches:* `{total_searches}`",
+        f"❤️ *Watchlist Adds:* `{total_watchlist}`",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "📈 *Last 7 Days*",
+    ]
+    for day_name, count in day_counts:
+        lines.append(f"`{day_name}` {_text_bar(count, max_day, 10)} `{count}`")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🔥 *Top 5 Searched*")
+    if top5:
+        for i, (t, c) in enumerate(top5, start=1):
+            lines.append(f"`{i}.` {t} — `{c}`")
+    else:
+        lines.append("_No searches yet_")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(
+        f"🔧 *Healer (30d):* ✅ `{heal_stats['approved']}` · "
+        f"❌ `{heal_stats['rejected']}` · ⚠️ `{heal_stats['low_confidence_skip']}`"
+    )
+    lines.append(f"🖥 *Servers:* ✅ `{up_n}` up · ❌ `{down_n}` down")
+
+    await msg.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3376,6 +3700,53 @@ async def suggest_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
     return ConversationHandler.END
 
+async def foryou_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("🚫 You are banned.")
+        return
+    if is_maintenance() and not is_admin(user.id):
+        await update.message.reply_text("🚧 Maintenance mode.")
+        return
+
+    uid = str(user.id)
+    history_titles = [h["movie"] for h in load_json("history").get(uid, [])]
+    watchlist_titles = [m["title"] for m in load_json("watchlist").get(uid, [])]
+    ratings_db = load_json("ratings")
+    loved_titles = [title for title, scores in ratings_db.items() if scores.get(uid, 0) >= 4]
+
+    if not history_titles and not watchlist_titles and not loved_titles:
+        await update.message.reply_text(
+            "🎯 *FOR YOU*\n\n"
+            "📭 Abhi tak koi activity nahi hai — kuch movies search karo, "
+            "⭐ rate karo ya ❤️ watchlist mein daalo, phir yahan tumhare taste "
+            "ke hisaab se personalized picks milenge! 🍿",
+            parse_mode="Markdown",
+        )
+        return
+
+    loader = await update.message.reply_text(
+        "🎯 Tumhara taste samajh raha hoon...\n" + progress_bar(0, 4), parse_mode="Markdown")
+    await animate_generic(loader, FRAMES["ai"])
+    result = await ai_personalized_recommend(history_titles, loved_titles, watchlist_titles)
+    try: await loader.delete()
+    except: pass
+
+    if result:
+        basis_bits = []
+        if history_titles:   basis_bits.append(f"{len(history_titles)} searches")
+        if loved_titles:     basis_bits.append(f"{len(loved_titles)} loved")
+        if watchlist_titles: basis_bits.append(f"{len(watchlist_titles)} watchlist")
+        basis = " • ".join(basis_bits)
+        await update.message.reply_text(
+            f"🎯 *FOR YOU* _(based on {basis})_\n\n{result}\n\n"
+            "━━━━━━━━━━━━━━━━━━\n_Movie naam type karo to search_ 🔎",
+            parse_mode="Markdown")
+    else:
+        await update.message.reply_text(
+            "⚠️ Abhi AI unavailable hai — thodi der baad try karo, ya /suggest use karo.",
+            parse_mode="Markdown")
+
 async def plotsearch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer()
@@ -3648,16 +4019,32 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     refs  = udata.get("refs",     0)
     badge = get_badge(pts)
     hist  = len(load_json("history").get(uid, []))
-    if pts < 100:    next_badge = f"🥉 Bronze needs `{100-pts}` more pts"
-    elif pts < 200:  next_badge = f"🥈 Silver needs `{200-pts}` more pts"
-    elif pts < 500:  next_badge = f"🥇 Gold needs `{500-pts}` more pts"
-    elif pts < 1000: next_badge = f"💎 Diamond needs `{1000-pts}` more pts"
-    else:            next_badge = "💎 *MAX BADGE!* 🎉"
+
+    tiers = [(100, "🥉 Bronze"), (200, "🥈 Silver"), (500, "🥇 Gold"), (1000, "💎 Diamond")]
+    floor, next_line = 0, None
+    for target, label in tiers:
+        if pts < target:
+            bar = progress_bar(pts - floor, target - floor, 10)
+            next_line = f"📈 *Next:* {label} — `{target-pts}` pts to go\n{bar}"
+            break
+        floor = target
+    if next_line is None:
+        next_line = "📈 *Next:* 💎 *MAX BADGE!* 🎉"
+
     await update.message.reply_text(
-        f"📊 *MY STATS*\n\n👤 *{update.effective_user.full_name}*\n\n"
-        f"🏆 Badge: {badge}\n⭐ Points: `{pts}`\n🔎 Searches: `{srch}`\n"
-        f"❤️ Watchlist: `{len(wl)}`\n📜 History: `{hist}` movies\n👥 Refers: `{refs}`\n\n"
-        f"📈 *Next:* {next_badge}\n\n_Search=+10 • Refer=+50 • Rate=+5_ 🎯",
+        f"╔═══════════════════╗\n"
+        f"   📊  *MY STATS*\n"
+        f"╚═══════════════════╝\n"
+        f"👤 *{update.effective_user.full_name}*\n"
+        f"🏆 {badge}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⭐ Points: `{pts}`   🔎 Searches: `{srch}`\n"
+        f"❤️ Watchlist: `{len(wl)}`   📜 History: `{hist}`\n"
+        f"👥 Refers: `{refs}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{next_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"_Search=+10 • Refer=+50 • Rate=+5_ 🎯",
         parse_mode="Markdown")
 
 async def refer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3669,8 +4056,13 @@ async def refer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_info = await context.bot.get_me()
     link     = f"https://t.me/{bot_info.username}?start={user.id}"
     await update.message.reply_text(
-        f"👥 *REFER & EARN*\n\n🔗 *Your Link:*\n`{link}`\n\n"
-        f"👥 Referred: `{refs}` users\n⭐ Points: `{pts}`\n\n"
+        f"╔═══════════════════╗\n"
+        f"   👥  *REFER & EARN*\n"
+        f"╚═══════════════════╝\n"
+        f"🔗 *Your Link:*\n`{link}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Referred: `{refs}` users   ⭐ Points: `{pts}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Har refer = +50 points 🎁\n_Share karo aur points kamao!_ 🚀",
         parse_mode="Markdown")
 
@@ -3678,14 +4070,21 @@ async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = load_json("users")
     sorted_users = sorted(users.values(), key=lambda x: x.get("points", 0), reverse=True)[:10]
     medals = ["🥇","🥈","🥉","🏅","🎖","⭐","🌟","💫","✨","🎬"]
-    text = "🏆 *LEADERBOARD*\n\n*Top 10 CineBot Users:*\n━━━━━━━━━━━━━━━━━━\n\n"
+    text = (
+        "╔═══════════════════╗\n"
+        "   🏆  *LEADERBOARD*\n"
+        "╚═══════════════════╝\n"
+        "*Top 10 CineBot Users*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+    )
     for i, u in enumerate(sorted_users):
         badge = get_badge(u.get("points", 0))
         raw_name = u.get("name", "Unknown")[:15]
         name = re.sub(r'([*_`\[\]()])', r'\\\1', raw_name)
         pts  = u.get("points", 0)
-        text += f"{medals[i]} *{name}* — `{pts}` pts {badge}\n"
-    text += "\n_Search=+10 | Refer=+50 | Rate=+5_ 🎯"
+        line = f"{medals[i]} *{name}* — `{pts}` pts {badge}\n"
+        text += ("┃ " + line) if i < 3 else line
+    text += "━━━━━━━━━━━━━━━━━━━━━━\n_Search=+10 | Refer=+50 | Rate=+5_ 🎯"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4605,7 +5004,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     searches = sum(u.get("searches", 0) for u in users.values())
     status   = "🔴 ON" if maint.get("active") else "🟢 OFF"
     ai_stat  = "✅ Groq" if GROQ_API else "❌ No API"
-    healer_stat = "✅ v4 Active" if _healer else "⚠️ Not init"
+    healer_stat = "✅ v7 Active" if _healer else "⚠️ Not init"
     now      = now_ist().timestamp()
     active_admins = sum(
         1 for v in admins.values()
@@ -4644,6 +5043,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("📋 Admin List",          callback_data="adm_listadmins")],
         [InlineKeyboardButton("📡 Server Status",       callback_data="adm_srv_status")],
         [InlineKeyboardButton("🔧 Healer Log",          callback_data="adm_healerlog")],
+        [InlineKeyboardButton("📊 Analytics Dashboard", callback_data="cmd_analytics")],
     ]
     sent = await update.message.reply_text(
         text, parse_mode="Markdown",
@@ -4987,7 +5387,7 @@ async def adm_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     searches = sum(u.get("searches", 0) for u in users.values())
     status   = "🔴 ON" if maint.get("active") else "🟢 OFF"
     ai_stat  = "✅ Groq" if GROQ_API else "❌ No API"
-    healer_stat = "✅ v4 Active" if _healer else "⚠️ Not init"
+    healer_stat = "✅ v7 Active" if _healer else "⚠️ Not init"
     mb = "🔴 Turn Maintenance OFF" if maint.get("active") else "🟢 Turn Maintenance ON"
     text = (
         f"👑 *ADMIN PANEL v10.0*  🎬\n\n"
@@ -5011,6 +5411,7 @@ async def adm_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("📋 Admin List",          callback_data="adm_listadmins")],
         [InlineKeyboardButton("📡 Server Status",       callback_data="adm_srv_status")],
         [InlineKeyboardButton("🔧 Healer Log",          callback_data="adm_healerlog")],
+        [InlineKeyboardButton("📊 Analytics Dashboard", callback_data="cmd_analytics")],
     ]
     sent = await query.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
     asyncio.create_task(auto_delete(sent, 60))
@@ -5026,7 +5427,7 @@ async def adm_healerlog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not log:
         await query.message.reply_text("📋 Koi heal history nahi. Sab servers stable hain! ✅")
         return
-    lines = ["📋 *HEALER v4 HISTORY* (last 10)\n━━━━━━━━━━━━━━━━━━"]
+    lines = ["📋 *HEALER v7 HISTORY* (last 10)\n━━━━━━━━━━━━━━━━━━"]
     for e in log:
         old_d = urlparse(e["old_url"] or "").netloc or (e["old_url"] or "")[:30]
         new_d = urlparse(e["new_url"] or "").netloc or (e["new_url"] or "")[:30]
@@ -5044,41 +5445,59 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ai_status = "✅ Groq AI Active" if GROQ_API else "⚠️ Set GROQ_API for AI features"
-    healer_status = "✅ Domain Healer v4 Active" if _healer else "⚠️ Healer not initialized"
+    healer_status = "✅ Domain Healer v7 Active" if _healer else "⚠️ Healer not initialized"
     await update.message.reply_text(
         f"ℹ️ *CINEBOT HELP*\n\n"
         f"🤖 *AI Status:* {ai_status}\n"
         f"🔧 *Healer:* {healer_status}\n\n"
         "🔎 *Movie Search:* Seedha naam type karo\n\n"
-        "📋 *Commands:*\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🤖 *AI Features*\n"
         "🎬 /movieinfo    — TMDB rich movie info\n"
         "📝 /fullreview   — Detailed AI review\n"
         "🎭 /moodmatch    — Mood match analysis\n"
         "🌟 /castinfo     — Cast & director info\n"
         "❓ /trivia       — MCQ trivia question\n"
-        "📡 /checkservers — Server health (Admin)\n"
-        "📊 /serverstats  — Uptime stats (Admin)\n"
-        "🔧 /healerlog    — Domain heal history (Admin)\n"
-        "📦 /index_channel — Group ka index banao (Admin)\n"
-        "📊 /grpstats     — Index stats (Admin)\n"
-        "🗑 /clrindex     — Index clear karo (Admin)\n"
-        "📢 /sendalert    — Alert all users (Admin)\n"
         "🤖 /suggest      — AI recommendations\n"
+        "🎯 /foryou       — Personalized picks (from your history)\n"
         "🔍 /plotsearch   — Search by plot\n"
         "🎭 /mood         — Mood-based picks\n"
-        "⚖️ /compare      — Compare 2 movies\n"
+        "⚖️ /compare      — Compare 2 movies\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🎲 *Discovery*\n"
         "🔥 /trending     — Weekly trending\n"
         "📅 /upcoming     — Coming soon\n"
+        "➖ /upcom_remove — Remove an upcoming alert\n"
         "🎲 /random       — Random movie\n"
-        "🎯 /daily        — Today's featured\n"
+        "🎯 /daily        — Today's featured\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "👤 *Your Stuff*\n"
         "❤️ /watchlist    — Saved movies\n"
         "🔔 /alerts       — Release alerts\n"
-        "🎮 /quiz         — Movie trivia\n"
-        "🏆 /leaderboard  — Top users\n"
         "📜 /history      — Search history\n"
-        "👥 /refer        — Refer & earn\n"
+        "📊 /mystats      — Points & badge\n"
+        "🏆 /leaderboard  — Top users\n"
         "🌐 /lang         — Language filter\n"
-        "📊 /mystats      — Points & badge\n\n"
+        "👥 /refer        — Refer & earn\n"
+        "🎮 /quiz         — Movie trivia game\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🛠 *Utility*\n"
+        "🧹 /clean        — Delete your message\n"
+        "❌ /cancel       — Cancel current action\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "👑 *Admin Only*\n"
+        "👑 /admin        — Admin panel\n"
+        "📊 /analytics    — Analytics dashboard\n"
+        "📡 /checkservers — Manual server health check\n"
+        "📊 /serverstats  — Uptime stats\n"
+        "🔧 /healerlog    — Domain heal history\n"
+        "📦 /index_channel — Group ka index banao\n"
+        "📊 /grpstats     — Index stats\n"
+        "🗑 /clrindex     — Index clear karo\n"
+        "📢 /sendalert    — Alert all users\n"
+        "👑 /addadmin     — Add admin\n"
+        "🚫 /removeadmin  — Remove admin\n"
+        "📋 /admins       — List admins\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "🎯 *Movie card pe buttons:*\n"
         "📝 Full Review • 🎭 Mood Match\n"
@@ -5127,7 +5546,7 @@ async def post_init(application):
         admin_id=ADMIN_ID,
     )
     _healer.register_handlers(application)
-    print("✅ Domain Healer v6 initialized")
+    print("✅ Domain Healer v7 initialized")
 
     # Group Index info
     if WATCHED_GROUP_IDS:
@@ -5204,6 +5623,7 @@ application.add_handler(CommandHandler("quiz",         quiz_cmd))
 application.add_handler(CommandHandler("refer",        refer_cmd))
 application.add_handler(CommandHandler("lang",         lang_cmd))
 application.add_handler(CommandHandler("mystats",      mystats_cmd))
+application.add_handler(CommandHandler("foryou",       foryou_cmd))
 application.add_handler(CommandHandler("admin",        admin_panel))
 application.add_handler(CommandHandler("clean",        clean_cmd))
 application.add_handler(CommandHandler("leaderboard",  leaderboard_cmd))
@@ -5218,6 +5638,7 @@ application.add_handler(CommandHandler("castinfo",     castinfo_cmd))
 application.add_handler(CommandHandler("trivia",       trivia_cmd))
 application.add_handler(CommandHandler(["checkservers","checkserver"], checkservers_cmd))
 application.add_handler(CommandHandler("serverstats",  serverstats_cmd))
+application.add_handler(CommandHandler("analytics",    analytics_cmd))
 application.add_handler(CommandHandler("sendalert",    sendalert_cmd))
 application.add_handler(CommandHandler("healerlog",     healerlog_cmd))
 application.add_handler(CommandHandler("index_channel", index_channel_cmd))
@@ -5238,13 +5659,14 @@ application.add_handler(CallbackQueryHandler(adm_export_cb,         pattern="^ad
 application.add_handler(CallbackQueryHandler(adm_listadmins_cb,     pattern="^adm_listadmins$"))
 application.add_handler(CallbackQueryHandler(adm_rmadmin_cb,        pattern="^adm_rmadmin_"))
 application.add_handler(CallbackQueryHandler(adm_healerlog_cb,      pattern="^adm_healerlog$"))
+application.add_handler(CallbackQueryHandler(analytics_cmd,         pattern="^cmd_analytics$"))
 
 # ── Server checker callbacks ──
 application.add_handler(CallbackQueryHandler(srvchk_refresh_cb,      pattern="^srvchk_refresh$"))
 application.add_handler(CallbackQueryHandler(srvchk_stats_cb,        pattern="^srvchk_stats$"))
 application.add_handler(CallbackQueryHandler(server_status_admin_cb, pattern="^adm_srv_status$"))
 
-# ── Healer v4 approval callbacks (registered via healer.register_handlers in post_init) ──
+# ── Healer v7 approval callbacks (registered via healer.register_handlers in post_init) ──
 
 # ── Full AI analysis callbacks ──
 application.add_handler(CallbackQueryHandler(fullreview_cb,   pattern="^frev_"))
@@ -5299,10 +5721,42 @@ application.add_handler(MessageHandler(
 # ── Movie search (last — catch-all) ──
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, movie))
 
-print("✅ CineBot v10 + Domain Healer v4 ULTRA — Ready!")
+print("✅ CineBot v10 + Domain Healer v7 ULTRA — Ready!")
 print(f"   Groq AI: {'✅' if GROQ_API else '❌'}")
 print(f"   Groq SDK: {'✅' if _groq_sdk_client else '❌ (pip install groq)'}")
 print(f"   TMDB: {'✅' if TMDB_API else '⚠️ optional'}")
+
+# ── Render port binder ──────────────────────────────────────────────
+# application.run_polling() below never opens a network port — it only
+# makes outbound calls to Telegram. Render's free "Web Service" tier,
+# though, expects something listening on $PORT and answering HTTP
+# requests; without that, Render's health check fails and it kills +
+# restarts the service on a loop even though the bot itself is fine.
+# This runs a tiny stdlib-only HTTP server in a background thread just
+# to satisfy that check — no Flask/uvicorn dependency needed.
+def _start_render_port_binder():
+    port = int(os.getenv("PORT", "10000"))
+
+    class _Health(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"CineBot is running.")
+        def log_message(self, *args):
+            pass  # keep Render's log stream focused on the bot, not HTTP noise
+
+    def _serve():
+        try:
+            server = http.server.HTTPServer(("0.0.0.0", port), _Health)
+            print(f"🌐 Render port binder listening on 0.0.0.0:{port}")
+            server.serve_forever()
+        except Exception as e:
+            print(f"⚠️ Render port binder failed to start: {e}")
+
+    threading.Thread(target=_serve, daemon=True).start()
+
+_start_render_port_binder()
 
 application.run_polling(
     allowed_updates=["message", "callback_query", "inline_query"],
