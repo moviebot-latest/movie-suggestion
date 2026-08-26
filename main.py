@@ -381,22 +381,31 @@ def build_star_bar(rating):
         return "⭐" * r5 + "☆" * (5 - r5)
     except: return "☆☆☆☆☆"
 
-def get_omdb(title, by_id=False):
+def _extract_year(query: str):
+    """Pull a trailing 4-digit year out of a search query, e.g.
+    'Toxic 2026' -> ('Toxic', '2026'). Returns (query, None) if no year is
+    found (or the year IS the whole query, e.g. someone searching '2012')."""
+    m = re.match(r'^(.*\S)\s+((?:19|20)\d{2})$', query.strip())
+    if m:
+        return m.group(1).strip(), m.group(2)
+    return query.strip(), None
+
+def get_omdb(title, by_id=False, year=None):
     try:
         param = "i" if by_id else "t"
-        r = requests.get(
-            f"https://www.omdbapi.com/?{param}={quote(title)}&apikey={OMDB_API}&plot=full",
-            timeout=8
-        )
+        url = f"https://www.omdbapi.com/?{param}={quote(title)}&apikey={OMDB_API}&plot=full"
+        if year and not by_id:
+            url += f"&y={quote(year)}"
+        r = requests.get(url, timeout=8)
         return r.json()
     except: return None
 
-def get_omdb_search(query):
+def get_omdb_search(query, year=None):
     try:
-        r = requests.get(
-            f"https://www.omdbapi.com/?s={quote(query)}&apikey={OMDB_API}",
-            timeout=8
-        )
+        url = f"https://www.omdbapi.com/?s={quote(query)}&apikey={OMDB_API}"
+        if year:
+            url += f"&y={quote(year)}"
+        r = requests.get(url, timeout=8)
         return r.json().get("Search", [])[:5]
     except: return []
 
@@ -3157,12 +3166,21 @@ async def _run_omdb_fallback(update, context, loader, raw_name, search_name, use
         )
     except: pass
 
-    data = await asyncio.to_thread(get_omdb, search_name)
+    title_only, year_hint = _extract_year(search_name)
+    if year_hint:
+        data = await asyncio.to_thread(get_omdb, title_only, False, year_hint)
+    else:
+        data = await asyncio.to_thread(get_omdb, search_name)
     if not data or data.get("Response") == "False":
-        data = await asyncio.to_thread(get_omdb, raw_name)
+        if year_hint:
+            data = await asyncio.to_thread(get_omdb, title_only)
+        if not data or data.get("Response") == "False":
+            data = await asyncio.to_thread(get_omdb, raw_name)
 
     if not data or data.get("Response") == "False":
-        results = await asyncio.to_thread(get_omdb_search, search_name)
+        results = await asyncio.to_thread(get_omdb_search, title_only, year_hint)
+        if not results and year_hint:
+            results = await asyncio.to_thread(get_omdb_search, title_only)
         if results:
             if len(results) == 1:
                 data = await asyncio.to_thread(get_omdb, results[0].get("imdbID", ""), True)
@@ -3211,9 +3229,22 @@ async def _run_full_search(update, context, raw_name: str):
     search_name = fixed_name if fixed_name.lower() != raw_name.lower() else raw_name
 
     # ── STEP 2: Show poster/info card ──
-    poster_data = await asyncio.to_thread(get_omdb, search_name)
+    # A trailing year ("Toxic 2026") is pulled out and sent as OMDB's own
+    # y= param instead of left in the title text — OMDB matches this far
+    # more accurately and it disambiguates same-named movies across years.
+    title_only, year_hint = _extract_year(search_name)
+    if year_hint:
+        poster_data = await asyncio.to_thread(get_omdb, title_only, False, year_hint)
+    else:
+        poster_data = await asyncio.to_thread(get_omdb, search_name)
+
     if not poster_data or poster_data.get("Response") == "False":
-        poster_data = await asyncio.to_thread(get_omdb, raw_name)
+        if year_hint:
+            # Maybe OMDB's listed year is off by one from what the user typed
+            # (release-date/region quirks) — retry title alone before giving up.
+            poster_data = await asyncio.to_thread(get_omdb, title_only)
+        if not poster_data or poster_data.get("Response") == "False":
+            poster_data = await asyncio.to_thread(get_omdb, raw_name)
 
     if poster_data and poster_data.get("Response") == "True":
         try: await loader.delete()
