@@ -2662,11 +2662,24 @@ async def grp_index_message(message) -> bool:
     try:
         await asyncio.to_thread(
             _db_grp_execute,
-            """INSERT OR IGNORE INTO group_files
+            """INSERT INTO group_files
                (chat_id, message_id, file_id, file_name, clean_title,
                 quality, language, year, size_mb, file_type,
                 content_type, ai_confidence, episode, indexed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                 file_id=excluded.file_id,
+                 file_name=excluded.file_name,
+                 clean_title=excluded.clean_title,
+                 quality=excluded.quality,
+                 language=excluded.language,
+                 year=excluded.year,
+                 size_mb=excluded.size_mb,
+                 file_type=excluded.file_type,
+                 content_type=excluded.content_type,
+                 ai_confidence=excluded.ai_confidence,
+                 episode=excluded.episode,
+                 indexed_at=excluded.indexed_at""",
             (
                 message.chat.id,
                 message.message_id,
@@ -3036,11 +3049,24 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
                         try:
                             await asyncio.to_thread(
                                 _db_grp_execute,
-                                """INSERT OR IGNORE INTO group_files
+                                """INSERT INTO group_files
                                    (chat_id, message_id, file_id, file_name, clean_title,
                                     quality, language, year, size_mb, file_type,
                                     content_type, ai_confidence, episode, indexed_at)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                   ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                                     file_id=excluded.file_id,
+                                     file_name=excluded.file_name,
+                                     clean_title=excluded.clean_title,
+                                     quality=excluded.quality,
+                                     language=excluded.language,
+                                     year=excluded.year,
+                                     size_mb=excluded.size_mb,
+                                     file_type=excluded.file_type,
+                                     content_type=excluded.content_type,
+                                     ai_confidence=excluded.ai_confidence,
+                                     episode=excluded.episode,
+                                     indexed_at=excluded.indexed_at""",
                                 (
                                     target_chat,
                                     check_id,
@@ -3195,6 +3221,55 @@ async def grpstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         last_ts = datetime.fromtimestamp(r["last"], tz=IST).strftime("%d %b, %I:%M %p") if r["last"] else "N/A"
         text += f"💬 Chat `{r['chat_id']}`\n   Files: `{r['cnt']}` | Last: _{last_ts}_\n\n"
     text += f"_Watched Groups: {WATCHED_GROUP_IDS or 'All (GROUP_IDS not set)'}_"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ── /grptitles — list indexed clean_titles for a chat (debugging search misses) ──
+async def grptitles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "❌ *Usage:* `/grptitles CHAT_ID [search_word]`\n\n"
+            "Shows the exact clean_title stored for each indexed file in "
+            "that chat — useful when Direct Video says 'not found' but you "
+            "know the file was indexed.",
+            parse_mode="Markdown"
+        )
+        return
+    try:
+        target_chat = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid chat ID.", parse_mode="Markdown")
+        return
+    filter_word = args[1].lower() if len(args) >= 2 else None
+
+    rows = await asyncio.to_thread(
+        _db_grp_fetch,
+        "SELECT clean_title, year, quality, episode, message_id FROM group_files WHERE chat_id=? ORDER BY message_id DESC LIMIT 100",
+        (target_chat,)
+    )
+    if filter_word:
+        rows = [r for r in rows if filter_word in r["clean_title"].lower()]
+
+    if not rows:
+        await update.message.reply_text(
+            f"📭 Chat `{target_chat}` mein koi indexed files nahi mile"
+            + (f" jisme '{filter_word}' ho." if filter_word else "."),
+            parse_mode="Markdown"
+        )
+        return
+
+    text = f"📋 *Indexed titles* — Chat `{target_chat}`\n━━━━━━━━━━━━━━━━━━\n\n"
+    for r in rows[:40]:
+        ep = f" `[{r['episode']}]`" if r.get("episode") else ""
+        text += f"• `{r['clean_title']}`{ep} ({r.get('year') or 'N/A'}) — `{r.get('quality','N/A')}`\n"
+    if len(rows) > 40:
+        text += f"\n_...and {len(rows)-40} more_"
+    if len(text) > 4000:
+        text = text[:3990] + "\n..._(truncated)_"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
@@ -3467,15 +3542,24 @@ async def _run_full_search(update, context, raw_name: str):
     )
     await animate_search(loader)
 
-    # ── STEP 1: AI spelling fix ──
-    fixed_name  = await ai_fix_movie_name(raw_name)
-    search_name = fixed_name if fixed_name.lower() != raw_name.lower() else raw_name
+    # ── STEP 0: Pull the year out BEFORE the AI touches the string ──
+    # ai_fix_movie_name is only told to "return the movie title" — it has
+    # no instruction to preserve a trailing year, so it can (and does)
+    # drop it, reformat it in parens, or "correct" it. Extracting the year
+    # from the user's raw, untouched input guarantees we never lose it.
+    raw_title_only, raw_year_hint = _extract_year(raw_name)
+
+    # ── STEP 1: AI spelling fix (title portion only, year stays intact) ──
+    fixed_name  = await ai_fix_movie_name(raw_title_only)
+    search_name = fixed_name if fixed_name.lower() != raw_title_only.lower() else raw_title_only
 
     # ── STEP 2: Show poster/info card ──
-    # A trailing year ("Toxic 2026") is pulled out and sent as OMDB's own
-    # y= param instead of left in the title text — OMDB matches this far
-    # more accurately and it disambiguates same-named movies across years.
-    title_only, year_hint = _extract_year(search_name)
+    # The year (from the user's original input, never AI-touched) is sent
+    # as OMDB's own y= param instead of left in the title text — OMDB
+    # matches this far more accurately and it disambiguates same-named
+    # movies across years.
+    title_only = search_name
+    year_hint  = raw_year_hint
     if year_hint:
         poster_data = await asyncio.to_thread(get_omdb, title_only, False, year_hint)
     else:
@@ -3514,7 +3598,8 @@ async def _run_full_search(update, context, raw_name: str):
         return
 
     # ── STEP 3: OMDB has nothing → try group index directly, else full fallback ──
-    grp_results = await grp_search(search_name, limit=20)
+    grp_search_query = f"{search_name} {year_hint}".strip() if year_hint else search_name
+    grp_results = await grp_search(grp_search_query, limit=20)
     if grp_results:
         try: await loader.delete()
         except: pass
@@ -5954,6 +6039,7 @@ application.add_handler(CommandHandler("sendalert",    sendalert_cmd))
 application.add_handler(CommandHandler("healerlog",     healerlog_cmd))
 application.add_handler(CommandHandler("index_channel", index_channel_cmd))
 application.add_handler(CommandHandler("grpstats",      grpstats_cmd))
+application.add_handler(CommandHandler("grptitles",     grptitles_cmd))
 application.add_handler(CommandHandler("clrindex",      clrindex_cmd))
 
 # ── Admin callbacks ──
