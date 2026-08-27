@@ -2821,33 +2821,71 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
     errors  = 0
     batch   = 0
 
-    # Get a rough idea of the latest msg_id by probing a few high numbers
-    # (plus smaller ones, for chats that don't have hundreds of messages yet)
-    latest_id = None
-    for probe in [9999, 4999, 1999, 999, 499, 199, 99, 49, 24, 9]:
+    # Find the highest reachable message ID two ways and take the best of
+    # both: (1) walk up from 1 — this is what actually finds small/new
+    # chats (a handful of messages), which large fixed probe points always
+    # miss, and it tolerates gaps like an unforwardable "channel created"
+    # service message; (2) probe a few big numbers ascending, for
+    # established chats with far more messages than a linear walk could
+    # reach quickly. Neither call is exact — the Bot API has no direct
+    # "highest message ID" lookup — but together they cover both ends.
+    async def _probe_ok(mid: int) -> bool:
         try:
             fwd = await asyncio.wait_for(
                 bot.forward_message(
-                    chat_id=source_chat_id,
-                    from_chat_id=target_chat,
-                    message_id=probe,
-                    disable_notification=True,
+                    chat_id=source_chat_id, from_chat_id=target_chat,
+                    message_id=mid, disable_notification=True,
                 ),
                 timeout=10,
             )
-            latest_id = probe
             try:
                 await fwd.delete()
             except Exception:
                 pass
-            break
+            return True
         except Exception:
-            pass
+            return False
 
-    if latest_id is None:
-        # Every probe missed — likely a small/new chat whose message IDs sit
-        # below our lowest probe point. Give the scan loop real room to work
-        # with instead of collapsing to a single attempt at message_id=1.
+    latest_id = 0
+    for mid in range(1, 51):
+        if await _probe_ok(mid):
+            latest_id = mid
+        await asyncio.sleep(0.05)
+
+    # Checkpoints alone can undershoot: a channel with, say, 150 messages
+    # would pass the 99 checkpoint but fail 199, leaving messages 100-150
+    # completely unseen. So after finding the last checkpoint that
+    # succeeds, refine forward from it one ID at a time (tolerating gaps
+    # like deleted messages) until the true top is reached — this finds
+    # the real latest message regardless of exactly where it falls.
+    checkpoints = [99, 199, 349, 499, 749, 999, 1499, 1999, 2999,
+                   4999, 6999, 9999, 14999, 19999, 29999, 49999]
+    last_checkpoint_ok = 0
+    for cp in checkpoints:
+        if await _probe_ok(cp):
+            last_checkpoint_ok = cp
+        else:
+            break
+        await asyncio.sleep(0.05)
+
+    refine_from = max(latest_id, last_checkpoint_ok)
+    if refine_from > 0:
+        probe, misses, steps = refine_from, 0, 0
+        while misses < 15 and steps < 3000:
+            probe  += 1
+            steps  += 1
+            if await _probe_ok(probe):
+                latest_id = probe
+                misses = 0
+            else:
+                misses += 1
+            await asyncio.sleep(0.03)
+    latest_id = max(latest_id, last_checkpoint_ok)
+
+    if latest_id == 0:
+        # Nothing forwardable anywhere in this search — very unusual,
+        # but give the scan loop real room to work with instead of dying
+        # after a single attempt.
         latest_id = limit + 20
 
     scanned  = 0
