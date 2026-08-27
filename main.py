@@ -391,6 +391,20 @@ def _extract_year(query: str):
         return m.group(1).strip(), m.group(2)
     return query.strip(), None
 
+def _extract_season(query: str):
+    """Pull a trailing season number out of a query, e.g.
+    'Operation Safed Sagar S3' or '... Season 3' -> ('Operation Safed
+    Sagar', '3'). Returns (query, None) if no season is specified."""
+    m = re.search(r'^(.*\S)\s+(?:season\s*|s)(\d{1,2})$', query.strip(), re.IGNORECASE)
+    if m:
+        return m.group(1).strip(), m.group(2)
+    return query.strip(), None
+
+def _episode_season_num(episode) -> Optional[int]:
+    """Extract the season number from a stored episode tag like 'S03E02' -> 3."""
+    m = re.match(r'S(\d{1,2})E\d{1,2}', episode or '', re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
 def get_omdb(title, by_id=False, year=None):
     try:
         param = "i" if by_id else "t"
@@ -2411,6 +2425,7 @@ def _grp_init_db():
             cols = [row[1] for row in con.execute("PRAGMA table_info(group_files)").fetchall()]
             for col_name, col_type in [
                 ("file_type", "TEXT"), ("content_type", "TEXT"), ("ai_confidence", "REAL"),
+                ("episode", "TEXT"),
             ]:
                 if col_name not in cols:
                     con.execute(f"ALTER TABLE group_files ADD COLUMN {col_name} {col_type}")
@@ -2582,8 +2597,8 @@ async def grp_index_message(message) -> bool:
             """INSERT OR IGNORE INTO group_files
                (chat_id, message_id, file_id, file_name, clean_title,
                 quality, language, year, size_mb, file_type,
-                content_type, ai_confidence, indexed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                content_type, ai_confidence, episode, indexed_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 message.chat.id,
                 message.message_id,
@@ -2597,6 +2612,7 @@ async def grp_index_message(message) -> bool:
                 file_type,
                 content_type,
                 confidence,
+                parsed["season_ep"],
                 time.time(),
             )
         )
@@ -2706,11 +2722,12 @@ async def grp_search(raw_query: str, limit: int = 5) -> List[dict]:
     Search group index for a movie title.
     1. AI spelling fix + year split (a trailing year like 'Toxic 2026' is
        matched against the indexed `year` column, not searched as literal
-       title text)
+       title text) + season split ('... S3' filters to just that season)
     2. SQLite LIKE search
     3. Fuzzy word + character-level similarity, boosted/penalized by year match
     4. AI semantic re-rank (only when results are ambiguous — e.g. several
        close scores that could be different movies with overlapping words)
+    5. Season filter applied, then sorted by score then episode order
     Returns top matches sorted by score.
     """
     # AI fix spelling
@@ -2720,12 +2737,18 @@ async def grp_search(raw_query: str, limit: int = 5) -> List[dict]:
     if not query_year:
         _, query_year = _extract_year(raw_query.lower().strip())
 
+    # Season filter: "Operation Safed Sagar S3" -> only S03 episodes returned
+    title_only, query_season = _extract_season(title_only)
+    if not query_season:
+        _, query_season = _extract_season(raw_query.lower().strip())
+
     # Also try original
     queries = list({title_only, query_clean, raw_query.lower().strip()})
 
     all_rows: List[dict] = []
     for q in queries:
         q_title, _ = _extract_year(q)
+        q_title, _ = _extract_season(q_title)
         # LIKE search on each word
         words = [w for w in re.findall(r'\w+', q_title) if len(w) > 2]
         if not words:
@@ -2776,6 +2799,21 @@ async def grp_search(raw_query: str, limit: int = 5) -> List[dict]:
             scored.sort(key=lambda x: x["_score"], reverse=True)
             # Drop anything AI is confident is a mismatch
             scored = [r for r in scored if r["_score"] > 0.2]
+
+    # If a season was specified ("... S3"), keep only that season's episodes
+    # — otherwise every season of the show would come back mixed together.
+    if query_season:
+        wanted = int(query_season)
+        season_only = [r for r in scored if _episode_season_num(r.get("episode")) == wanted]
+        if season_only:
+            scored = season_only
+        # else: that season isn't indexed yet — fall through and show
+        # whatever did match rather than returning nothing.
+
+    # Within near-identical scores (same series, different episodes), sort
+    # by episode too so results come back in watch order rather than
+    # whatever order the DB happened to return them in.
+    scored.sort(key=lambda x: (-round(x["_score"], 2), x.get("episode") or ""))
 
     return scored[:limit]
 
@@ -2933,8 +2971,8 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
                                 """INSERT OR IGNORE INTO group_files
                                    (chat_id, message_id, file_id, file_name, clean_title,
                                     quality, language, year, size_mb, file_type,
-                                    content_type, ai_confidence, indexed_at)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    content_type, ai_confidence, episode, indexed_at)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (
                                     target_chat,
                                     check_id,
@@ -2948,6 +2986,7 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
                                     file_type,
                                     content_type,
                                     confidence,
+                                    parsed["season_ep"],
                                     time.time(),
                                 )
                             )
@@ -3120,12 +3159,15 @@ def _grp_file_caption(r: dict) -> str:
     quality  = r.get("quality",  "N/A")
     language = r.get("language", "N/A")
     year     = r.get("year",     "")
+    episode  = r.get("episode",  "")
     size_mb  = r.get("size_mb",  0.0)
     size_str = f"{size_mb:.0f} MB" if size_mb else "N/A"
     return (
         f"🎬 *{r['clean_title'].title()}*"
-        + (f" `({year})`" if year else "") + "\n"
-        f"📺 `{quality}` | 🌐 `{language}` | 💾 `{size_str}`"
+        + (f" `({year})`" if year else "")
+        + (f" `[{episode}]`" if episode else "") + "\n"
+        f"📺 `{quality}` | 🌐 `{language}` | 💾 `{size_str}`\n"
+        f"▶️ _Better sound ke liye **VLC Player** mein khole_"
     )
 
 
@@ -3156,8 +3198,10 @@ async def _grp_send_one_file(context, chat_id, r: dict) -> bool:
             return False
 
 
-async def _grp_send_all_files(update_or_query_message, context, chat_id, grp_results, user_id, search_name):
-    """Send ALL matching files from group index, then a summary + web-server fallback button."""
+async def _grp_send_all_files(update_or_query_message, context, chat_id, grp_results, user_id, search_name, already_sent=0):
+    """Send remaining matching files from group index, then a summary + web-server fallback button.
+    already_sent accounts for sample files a caller already sent (e.g. the
+    confirm-flow preview), so the final count reflects the true total."""
     sent_count = 0
     fail_count = 0
     for r in grp_results:
@@ -3168,10 +3212,11 @@ async def _grp_send_all_files(update_or_query_message, context, chat_id, grp_res
         else:
             fail_count += 1
 
+    total_sent = sent_count + already_sent
     kb = [[InlineKeyboardButton("🌐 6 Web Servers", callback_data=f"grp_fallback_{search_name[:30]}")]]
     await update_or_query_message.reply_text(
         f"✅ *Done!*\n\n"
-        f"📤 Sent: `{sent_count}` files\n"
+        f"📤 Sent: `{total_sent}` files\n"
         + (f"❌ Failed: `{fail_count}`\n" if fail_count else "")
         + f"\n_Web servers bhi chahiye?_ 👇",
         parse_mode="Markdown",
@@ -3241,26 +3286,32 @@ async def _grp_offer_confirmation(context, chat_id, grp_results, raw_name, searc
     title_display = grp_results[0]["clean_title"].title()
     score_pct     = int(grp_results[0]["_score"] * 100)
 
+    episodes = sorted({r["episode"] for r in grp_results if r.get("episode")})
+    ep_range = f" (`{episodes[0]}`–`{episodes[-1]}`)" if len(episodes) > 1 else (f" (`{episodes[0]}`)" if episodes else "")
+
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
             f"⚡ *Group mein mila!*\n\n"
             f"🎬 *{title_display}*\n"
             f"🎯 Match: `{score_pct}%`\n"
-            f"📦 Total files: `{len(grp_results)}`\n\n"
+            f"📦 Total files: `{len(grp_results)}`{ep_range}\n\n"
             f"_Pehle {min(3, len(grp_results))} sample bhej raha hoon, check karo 👇_"
         ),
         parse_mode="Markdown",
     )
 
-    sample = grp_results[:3]
+    sample    = grp_results[:3]
+    remaining = grp_results[3:]
     for r in sample:
         await _grp_send_one_file(context, chat_id, r)
         await asyncio.sleep(0.3)
 
-    # Store pending results for this user so callbacks can retrieve them
+    # Only the files NOT already sent as samples go to the confirm-yes
+    # callback — otherwise those first 3 get sent twice when confirmed.
     grp_pending_confirm[user_id] = {
-        "results": grp_results,
+        "results": remaining,
+        "already_sent": len(sample),
         "search_name": search_name,
         "raw_name": raw_name,
     }
@@ -3425,6 +3476,7 @@ async def grp_confirm_yes_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _grp_send_all_files(
         query.message, context, query.message.chat.id,
         pending["results"], user_id, pending["search_name"],
+        already_sent=pending.get("already_sent", 0),
     )
 
 
