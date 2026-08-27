@@ -2456,6 +2456,11 @@ _grp_db_lock = threading.Lock()
 grp_pending_confirm: dict = {}
 # key = user_id (int) -> True  → bot waiting for user to type "name year" after "Wrong"
 grp_awaiting_retry: dict = {}
+# key = msg_id (str) -> float (time.time()) while a "Direct Video" request
+# for that poster card is actively being processed — blocks a duplicate
+# double-tap from running the same search+send pipeline twice and sending
+# the file 2x. Stale entries (>90s old) are ignored as a safety net.
+grp_direct_video_inflight: dict = {}
 
 
 # ── DB init ──
@@ -3582,46 +3587,64 @@ async def grp_confirm_no_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     user_id = query.from_user.id
-    await query.answer()
 
     msg_id = query.data.replace("gv_", "")
-    stored = context.user_data.get(msg_id)
 
-    if not stored or not stored.get("title"):
-        await query.message.reply_text(
-            "⚠️ Session expired. Movie naam dubara bhejo.",
-            parse_mode="Markdown",
-        )
+    # Guard against double-tap / repeated tap while a previous request for
+    # this same poster card is still running — without this, a fast second
+    # tap starts a second full search+send pipeline in parallel and the
+    # same file(s) get delivered twice.
+    # Locks carry a timestamp so a lock that somehow never got released
+    # (crash, unexpected exception) can't permanently jam that card —
+    # anything older than 90s is treated as stale and ignored.
+    lock_ts = grp_direct_video_inflight.get(msg_id)
+    if lock_ts and (time.time() - lock_ts) < 90:
+        await query.answer("⏳ Already fetching, thoda wait karo...", show_alert=False)
         return
 
-    title = stored["title"]
-    year  = stored.get("year", "")
-    search_name = f"{title} {year}".strip()
+    grp_direct_video_inflight[msg_id] = time.time()
+    try:
+        await query.answer()
 
-    chat_id = query.message.chat.id
-    loader  = await context.bot.send_message(
-        chat_id=chat_id,
-        text="⏳ *Finding...*\n" + progress_bar(0, 6),
-        parse_mode="Markdown",
-    )
-    await animate_search(loader)
+        stored = context.user_data.get(msg_id)
 
-    grp_results = await grp_search(title, limit=20)
-    try: await loader.delete()
-    except: pass
+        if not stored or not stored.get("title"):
+            await query.message.reply_text(
+                "⚠️ Session expired. Movie naam dubara bhejo.",
+                parse_mode="Markdown",
+            )
+            return
 
-    if grp_results:
-        await _grp_auto_send_or_confirm(context, chat_id, grp_results, search_name, title, user_id)
-    else:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🌐 6 Web Servers", callback_data=f"grp_fallback_{title[:30]}")],
-        ])
-        await context.bot.send_message(
+        title = stored["title"]
+        year  = stored.get("year", "")
+        search_name = f"{title} {year}".strip()
+
+        chat_id = query.message.chat.id
+        loader  = await context.bot.send_message(
             chat_id=chat_id,
-            text=f"❌ *'{title}'* group mein nahi mili.\n\n_Web servers try karo 👇_",
+            text="⏳ *Finding...*\n" + progress_bar(0, 6),
             parse_mode="Markdown",
-            reply_markup=kb,
         )
+        await animate_search(loader)
+
+        grp_results = await grp_search(title, limit=20)
+        try: await loader.delete()
+        except: pass
+
+        if grp_results:
+            await _grp_auto_send_or_confirm(context, chat_id, grp_results, search_name, title, user_id)
+        else:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🌐 6 Web Servers", callback_data=f"grp_fallback_{title[:30]}")],
+            ])
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ *'{title}'* group mein nahi mili.\n\n_Web servers try karo 👇_",
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+    finally:
+        grp_direct_video_inflight.pop(msg_id, None)
 
 
 # ── Callback: user ne "6 Web Servers" choose kiya when group had result ──
