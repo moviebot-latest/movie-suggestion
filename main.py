@@ -424,47 +424,6 @@ def get_omdb_search(query, year=None):
         return r.json().get("Search", [])[:5]
     except: return []
 
-def get_tmdb_director(title, year=None):
-    """Fallback director lookup via TMDB when OMDB returns N/A — checks
-    movies first, then TV shows (TV credits use 'created_by' since TV
-    series often don't have a single 'Director' crew job per episode)."""
-    if not TMDB_API: return None
-    try:
-        # Try as a movie first
-        params = f"api_key={TMDB_API}&query={quote(title)}"
-        if year: params += f"&year={quote(str(year))}"
-        r = requests.get(f"https://api.themoviedb.org/3/search/movie?{params}", timeout=8)
-        rs = r.json().get("results", [])
-        if rs:
-            mid = rs[0]["id"]
-            r2 = requests.get(f"https://api.themoviedb.org/3/movie/{mid}/credits?api_key={TMDB_API}", timeout=8)
-            crew = r2.json().get("crew", [])
-            directors = [p["name"] for p in crew if p.get("job") == "Director"]
-            if directors:
-                return ", ".join(directors[:3])
-
-        # Fall back to TV search (covers series/anime like NANA)
-        r = requests.get(f"https://api.themoviedb.org/3/search/tv?api_key={TMDB_API}&query={quote(title)}", timeout=8)
-        rs = r.json().get("results", [])
-        if rs:
-            tid = rs[0]["id"]
-            r2 = requests.get(f"https://api.themoviedb.org/3/tv/{tid}?api_key={TMDB_API}", timeout=8)
-            tv_data = r2.json()
-            creators = [p["name"] for p in tv_data.get("created_by", [])]
-            if creators:
-                return ", ".join(creators[:3])
-            # Some entries have no created_by but do have crew credits
-            r3 = requests.get(f"https://api.themoviedb.org/3/tv/{tid}/credits?api_key={TMDB_API}", timeout=8)
-            crew = r3.json().get("crew", [])
-            directors = [p["name"] for p in crew if p.get("job") in ("Director", "Series Director")]
-            if directors:
-                return ", ".join(directors[:3])
-        return None
-    except Exception as e:
-        print(f"⚠️ get_tmdb_director failed: {e}")
-        return None
-
-
 def get_tmdb_similar(title):
     if not TMDB_API: return []
     try:
@@ -1072,14 +1031,6 @@ async def _send_movie_card(update, context, data, reply_to=None, is_search=False
     boxoff   = data.get("BoxOffice",  "N/A")
     imdb_id  = data.get("imdbID",     "")
 
-    if not director or director == "N/A":
-        try:
-            tmdb_director = await asyncio.to_thread(get_tmdb_director, title, year if year != "N/A" else None)
-            if tmdb_director:
-                director = tmdb_director
-        except Exception as e:
-            print(f"⚠️ TMDB director fallback failed: {e}")
-
     rt_score = "N/A"
     for r in data.get("Ratings", []):
         if "Rotten Tomatoes" in r.get("Source", ""):
@@ -1160,22 +1111,8 @@ async def _send_movie_card(update, context, data, reply_to=None, is_search=False
 
     msg_obj = reply_to if reply_to else update.message
 
-    # msg_id normally comes from the sent message's own message_id, but we
-    # need it BEFORE sending (to build the Direct Video button pointing at
-    # the right user_data key). Use a short-lived unique placeholder based
-    # on time + object id, then remap it to the real message_id right after
-    # sending — this avoids ever showing a non-functional "gv_pending"
-    # button that fails if tapped before an edit lands.
-    provisional_id = f"tmp{int(time.time()*1000)}"
-    context.user_data[provisional_id] = {
-        "servers": urls, "names": names, "trailer": trailer,
-        "title": title, "year": year, "rating": rating,
-        "director": director, "actors": actors, "plot": plot,
-        "imdb_id": imdb_id, "genre": genre, "awards": awards,
-    }
-
     temp_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎬 Direct Video ⚡", callback_data=f"gv_{provisional_id}")],
+        [InlineKeyboardButton("🎬 Direct Video ⚡", callback_data="gv_pending")],
         [InlineKeyboardButton("🎬 Trailer",   url=trailer),
          InlineKeyboardButton("📝 Subtitles", url=subs_url)],
         [InlineKeyboardButton("❤️ Watchlist", callback_data=f"wl_save|{title.replace('|','').replace('\\','')[:40]}|{year}|{rating}"),
@@ -1208,12 +1145,12 @@ async def _send_movie_card(update, context, data, reply_to=None, is_search=False
             caption, parse_mode="Markdown", reply_markup=temp_keyboard)
 
     msg_id = str(sent.message_id)
-    # Remap the provisional key to the real message_id — same dict object,
-    # just filed under the id every other callback (rev_, fun_, rate_, etc.)
-    # expects. If the Direct Video button is tapped between send and this
-    # line, it's still resolvable because provisional_id is already valid
-    # in user_data (see grp_direct_video_cb's fallback lookup below).
-    context.user_data[msg_id] = context.user_data.pop(provisional_id)
+    context.user_data[msg_id] = {
+        "servers": urls, "names": names, "trailer": trailer,
+        "title": title, "year": year, "rating": rating,
+        "director": director, "actors": actors, "plot": plot,
+        "imdb_id": imdb_id, "genre": genre, "awards": awards,
+    }
 
     async def _bg_resolve_links():
         try:
@@ -2456,11 +2393,6 @@ _grp_db_lock = threading.Lock()
 grp_pending_confirm: dict = {}
 # key = user_id (int) -> True  → bot waiting for user to type "name year" after "Wrong"
 grp_awaiting_retry: dict = {}
-# key = msg_id (str) -> float (time.time()) while a "Direct Video" request
-# for that poster card is actively being processed — blocks a duplicate
-# double-tap from running the same search+send pipeline twice and sending
-# the file 2x. Stale entries (>90s old) are ignored as a safety net.
-grp_direct_video_inflight: dict = {}
 
 
 # ── DB init ──
@@ -2662,24 +2594,11 @@ async def grp_index_message(message) -> bool:
     try:
         await asyncio.to_thread(
             _db_grp_execute,
-            """INSERT INTO group_files
+            """INSERT OR IGNORE INTO group_files
                (chat_id, message_id, file_id, file_name, clean_title,
                 quality, language, year, size_mb, file_type,
                 content_type, ai_confidence, episode, indexed_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(chat_id, message_id) DO UPDATE SET
-                 file_id=excluded.file_id,
-                 file_name=excluded.file_name,
-                 clean_title=excluded.clean_title,
-                 quality=excluded.quality,
-                 language=excluded.language,
-                 year=excluded.year,
-                 size_mb=excluded.size_mb,
-                 file_type=excluded.file_type,
-                 content_type=excluded.content_type,
-                 ai_confidence=excluded.ai_confidence,
-                 episode=excluded.episode,
-                 indexed_at=excluded.indexed_at""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 message.chat.id,
                 message.message_id,
@@ -3049,24 +2968,11 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
                         try:
                             await asyncio.to_thread(
                                 _db_grp_execute,
-                                """INSERT INTO group_files
+                                """INSERT OR IGNORE INTO group_files
                                    (chat_id, message_id, file_id, file_name, clean_title,
                                     quality, language, year, size_mb, file_type,
                                     content_type, ai_confidence, episode, indexed_at)
-                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                                   ON CONFLICT(chat_id, message_id) DO UPDATE SET
-                                     file_id=excluded.file_id,
-                                     file_name=excluded.file_name,
-                                     clean_title=excluded.clean_title,
-                                     quality=excluded.quality,
-                                     language=excluded.language,
-                                     year=excluded.year,
-                                     size_mb=excluded.size_mb,
-                                     file_type=excluded.file_type,
-                                     content_type=excluded.content_type,
-                                     ai_confidence=excluded.ai_confidence,
-                                     episode=excluded.episode,
-                                     indexed_at=excluded.indexed_at""",
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (
                                     target_chat,
                                     check_id,
@@ -3224,55 +3130,6 @@ async def grpstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-# ── /grptitles — list indexed clean_titles for a chat (debugging search misses) ──
-async def grptitles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.")
-        return
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "❌ *Usage:* `/grptitles CHAT_ID [search_word]`\n\n"
-            "Shows the exact clean_title stored for each indexed file in "
-            "that chat — useful when Direct Video says 'not found' but you "
-            "know the file was indexed.",
-            parse_mode="Markdown"
-        )
-        return
-    try:
-        target_chat = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid chat ID.", parse_mode="Markdown")
-        return
-    filter_word = args[1].lower() if len(args) >= 2 else None
-
-    rows = await asyncio.to_thread(
-        _db_grp_fetch,
-        "SELECT clean_title, year, quality, episode, message_id FROM group_files WHERE chat_id=? ORDER BY message_id DESC LIMIT 100",
-        (target_chat,)
-    )
-    if filter_word:
-        rows = [r for r in rows if filter_word in r["clean_title"].lower()]
-
-    if not rows:
-        await update.message.reply_text(
-            f"📭 Chat `{target_chat}` mein koi indexed files nahi mile"
-            + (f" jisme '{filter_word}' ho." if filter_word else "."),
-            parse_mode="Markdown"
-        )
-        return
-
-    text = f"📋 *Indexed titles* — Chat `{target_chat}`\n━━━━━━━━━━━━━━━━━━\n\n"
-    for r in rows[:40]:
-        ep = f" `[{r['episode']}]`" if r.get("episode") else ""
-        text += f"• `{r['clean_title']}`{ep} ({r.get('year') or 'N/A'}) — `{r.get('quality','N/A')}`\n"
-    if len(rows) > 40:
-        text += f"\n_...and {len(rows)-40} more_"
-    if len(text) > 4000:
-        text = text[:3990] + "\n..._(truncated)_"
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
 # ── /clrindex — clear index ──
 async def clrindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -3309,8 +3166,7 @@ def _grp_file_caption(r: dict) -> str:
         f"🎬 *{r['clean_title'].title()}*"
         + (f" `({year})`" if year else "")
         + (f" `[{episode}]`" if episode else "") + "\n"
-        f"📺 `{quality}` | 🌐 `{language}` | 💾 `{size_str}`\n"
-        f"▶️ _Better sound ke liye **VLC Player** mein khole_"
+        f"📺 `{quality}` | 🌐 `{language}` | 💾 `{size_str}`"
     )
 
 
@@ -3542,24 +3398,15 @@ async def _run_full_search(update, context, raw_name: str):
     )
     await animate_search(loader)
 
-    # ── STEP 0: Pull the year out BEFORE the AI touches the string ──
-    # ai_fix_movie_name is only told to "return the movie title" — it has
-    # no instruction to preserve a trailing year, so it can (and does)
-    # drop it, reformat it in parens, or "correct" it. Extracting the year
-    # from the user's raw, untouched input guarantees we never lose it.
-    raw_title_only, raw_year_hint = _extract_year(raw_name)
-
-    # ── STEP 1: AI spelling fix (title portion only, year stays intact) ──
-    fixed_name  = await ai_fix_movie_name(raw_title_only)
-    search_name = fixed_name if fixed_name.lower() != raw_title_only.lower() else raw_title_only
+    # ── STEP 1: AI spelling fix ──
+    fixed_name  = await ai_fix_movie_name(raw_name)
+    search_name = fixed_name if fixed_name.lower() != raw_name.lower() else raw_name
 
     # ── STEP 2: Show poster/info card ──
-    # The year (from the user's original input, never AI-touched) is sent
-    # as OMDB's own y= param instead of left in the title text — OMDB
-    # matches this far more accurately and it disambiguates same-named
-    # movies across years.
-    title_only = search_name
-    year_hint  = raw_year_hint
+    # A trailing year ("Toxic 2026") is pulled out and sent as OMDB's own
+    # y= param instead of left in the title text — OMDB matches this far
+    # more accurately and it disambiguates same-named movies across years.
+    title_only, year_hint = _extract_year(search_name)
     if year_hint:
         poster_data = await asyncio.to_thread(get_omdb, title_only, False, year_hint)
     else:
@@ -3568,27 +3415,9 @@ async def _run_full_search(update, context, raw_name: str):
     if not poster_data or poster_data.get("Response") == "False":
         if year_hint:
             # Maybe OMDB's listed year is off by one from what the user typed
-            # (release-date/region quirks) — retry title alone, but only
-            # accept the result if its year is actually close to what was
-            # asked for. Otherwise a query for a not-yet-listed movie (e.g.
-            # "Toxic 2026") would silently return an unrelated same-named
-            # movie from a completely different year (e.g. "Toxic" 2008).
-            retry_data = await asyncio.to_thread(get_omdb, title_only)
-            if retry_data and retry_data.get("Response") == "True":
-                retry_year_str = re.search(r'\d{4}', retry_data.get("Year", "") or "")
-                try:
-                    year_diff = abs(int(retry_year_str.group()) - int(year_hint)) if retry_year_str else None
-                except ValueError:
-                    year_diff = None
-                if year_diff is not None and year_diff <= 1:
-                    poster_data = retry_data
-                # else: leave poster_data as the failed response — don't
-                # silently substitute a different movie from another year.
-        if (not poster_data or poster_data.get("Response") == "False") and not year_hint:
-            # Only try the raw, unparsed query as a last resort when there
-            # was no year hint to begin with — if the user DID specify a
-            # year and nothing matched it above, searching raw_name here
-            # would just re-introduce the same wrong-year-movie problem.
+            # (release-date/region quirks) — retry title alone before giving up.
+            poster_data = await asyncio.to_thread(get_omdb, title_only)
+        if not poster_data or poster_data.get("Response") == "False":
             poster_data = await asyncio.to_thread(get_omdb, raw_name)
 
     if poster_data and poster_data.get("Response") == "True":
@@ -3598,8 +3427,7 @@ async def _run_full_search(update, context, raw_name: str):
         return
 
     # ── STEP 3: OMDB has nothing → try group index directly, else full fallback ──
-    grp_search_query = f"{search_name} {year_hint}".strip() if year_hint else search_name
-    grp_results = await grp_search(grp_search_query, limit=20)
+    grp_results = await grp_search(search_name, limit=20)
     if grp_results:
         try: await loader.delete()
         except: pass
@@ -3672,64 +3500,46 @@ async def grp_confirm_no_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     user_id = query.from_user.id
+    await query.answer()
 
     msg_id = query.data.replace("gv_", "")
+    stored = context.user_data.get(msg_id) if msg_id != "pending" else None
 
-    # Guard against double-tap / repeated tap while a previous request for
-    # this same poster card is still running — without this, a fast second
-    # tap starts a second full search+send pipeline in parallel and the
-    # same file(s) get delivered twice.
-    # Locks carry a timestamp so a lock that somehow never got released
-    # (crash, unexpected exception) can't permanently jam that card —
-    # anything older than 90s is treated as stale and ignored.
-    lock_ts = grp_direct_video_inflight.get(msg_id)
-    if lock_ts and (time.time() - lock_ts) < 90:
-        await query.answer("⏳ Already fetching, thoda wait karo...", show_alert=False)
-        return
-
-    grp_direct_video_inflight[msg_id] = time.time()
-    try:
-        await query.answer()
-
-        stored = context.user_data.get(msg_id)
-
-        if not stored or not stored.get("title"):
-            await query.message.reply_text(
-                "⚠️ Session expired. Movie naam dubara bhejo.",
-                parse_mode="Markdown",
-            )
-            return
-
-        title = stored["title"]
-        year  = stored.get("year", "")
-        search_name = f"{title} {year}".strip()
-
-        chat_id = query.message.chat.id
-        loader  = await context.bot.send_message(
-            chat_id=chat_id,
-            text="⏳ *Finding...*\n" + progress_bar(0, 6),
+    if not stored or not stored.get("title"):
+        await query.message.reply_text(
+            "⚠️ Session expired. Movie naam dubara bhejo.",
             parse_mode="Markdown",
         )
-        await animate_search(loader)
+        return
 
-        grp_results = await grp_search(title, limit=20)
-        try: await loader.delete()
-        except: pass
+    title = stored["title"]
+    year  = stored.get("year", "")
+    search_name = f"{title} {year}".strip()
 
-        if grp_results:
-            await _grp_auto_send_or_confirm(context, chat_id, grp_results, search_name, title, user_id)
-        else:
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🌐 6 Web Servers", callback_data=f"grp_fallback_{title[:30]}")],
-            ])
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ *'{title}'* group mein nahi mili.\n\n_Web servers try karo 👇_",
-                parse_mode="Markdown",
-                reply_markup=kb,
-            )
-    finally:
-        grp_direct_video_inflight.pop(msg_id, None)
+    chat_id = query.message.chat.id
+    loader  = await context.bot.send_message(
+        chat_id=chat_id,
+        text="⏳ *Finding...*\n" + progress_bar(0, 6),
+        parse_mode="Markdown",
+    )
+    await animate_search(loader)
+
+    grp_results = await grp_search(title, limit=20)
+    try: await loader.delete()
+    except: pass
+
+    if grp_results:
+        await _grp_auto_send_or_confirm(context, chat_id, grp_results, search_name, title, user_id)
+    else:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 6 Web Servers", callback_data=f"grp_fallback_{title[:30]}")],
+        ])
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ *'{title}'* group mein nahi mili.\n\n_Web servers try karo 👇_",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
 
 
 # ── Callback: user ne "6 Web Servers" choose kiya when group had result ──
@@ -6039,7 +5849,6 @@ application.add_handler(CommandHandler("sendalert",    sendalert_cmd))
 application.add_handler(CommandHandler("healerlog",     healerlog_cmd))
 application.add_handler(CommandHandler("index_channel", index_channel_cmd))
 application.add_handler(CommandHandler("grpstats",      grpstats_cmd))
-application.add_handler(CommandHandler("grptitles",     grptitles_cmd))
 application.add_handler(CommandHandler("clrindex",      clrindex_cmd))
 
 # ── Admin callbacks ──
