@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import difflib
 import time
 import random
 import logging
@@ -49,7 +50,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 # Groq REST API config (used by the lightweight HTTP-based AI calls)
 GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 def now_ist() -> datetime:
     """Current time as an IST-aware datetime."""
@@ -2627,19 +2628,35 @@ def _db_grp_fetch(query: str, params: tuple = ()) -> list:
 
 
 # ── Fuzzy title search ──
-def _grp_title_similarity(a: str, b: str) -> float:
-    """Simple word-overlap similarity score 0.0-1.0"""
-    a_words = set(re.findall(r'\w+', a.lower()))
-    b_words = set(re.findall(r'\w+', b.lower()))
+def _grp_title_similarity(a: str, b: str, query_year: str = None, row_year=None) -> float:
+    """Word-overlap + character-level similarity (0.0-1.0), with a year
+    signal layered on top to tell apart same-titled movies from different
+    years (remakes, or a sequel sharing its predecessor's base name)."""
+    a_norm, b_norm = a.lower().strip(), b.lower().strip()
+    if a_norm == b_norm and a_norm:
+        return 1.0  # exact text match — no ambiguity possible
+
+    a_words = set(re.findall(r'\w+', a_norm))
+    b_words = set(re.findall(r'\w+', b_norm))
     if not a_words or not b_words:
         return 0.0
-    common = a_words & b_words
-    # Ignore very short/common words
     stop   = {"the","a","an","of","in","on","at","to","and","or","is","it","wa","ho"}
-    common -= stop
+    common = (a_words & b_words) - stop
     if not common:
         return 0.0
-    return len(common) / max(len(a_words), len(b_words))
+
+    word_score = len(common) / max(len(a_words), len(b_words))
+    # Character-level ratio catches close variants word-overlap alone misses
+    # (e.g. 'spiderman' vs 'spider man' share zero whole-word tokens).
+    char_score = difflib.SequenceMatcher(None, a_norm, b_norm).ratio()
+    score = (0.7 * word_score) + (0.3 * char_score)
+
+    if query_year and row_year:
+        if str(query_year) == str(row_year):
+            score = min(1.0, score + 0.15)   # confirmed same release year
+        else:
+            score = max(0.0, score - 0.25)   # different year — likely a different film sharing a title
+    return score
 
 
 async def _ai_semantic_rerank(query: str, candidates: List[dict], top_n: int = 8) -> dict:
@@ -2687,9 +2704,11 @@ async def _ai_semantic_rerank(query: str, candidates: List[dict], top_n: int = 8
 async def grp_search(raw_query: str, limit: int = 5) -> List[dict]:
     """
     Search group index for a movie title.
-    1. AI spelling fix
+    1. AI spelling fix + year split (a trailing year like 'Toxic 2026' is
+       matched against the indexed `year` column, not searched as literal
+       title text)
     2. SQLite LIKE search
-    3. Fuzzy word-overlap scoring
+    3. Fuzzy word + character-level similarity, boosted/penalized by year match
     4. AI semantic re-rank (only when results are ambiguous — e.g. several
        close scores that could be different movies with overlapping words)
     Returns top matches sorted by score.
@@ -2697,14 +2716,18 @@ async def grp_search(raw_query: str, limit: int = 5) -> List[dict]:
     # AI fix spelling
     fixed = await ai_fix_movie_name(raw_query)
     query_clean = fixed.lower().strip()
+    title_only, query_year = _extract_year(query_clean)
+    if not query_year:
+        _, query_year = _extract_year(raw_query.lower().strip())
 
     # Also try original
-    queries = list({query_clean, raw_query.lower().strip()})
+    queries = list({title_only, query_clean, raw_query.lower().strip()})
 
     all_rows: List[dict] = []
     for q in queries:
+        q_title, _ = _extract_year(q)
         # LIKE search on each word
-        words = [w for w in re.findall(r'\w+', q) if len(w) > 2]
+        words = [w for w in re.findall(r'\w+', q_title) if len(w) > 2]
         if not words:
             continue
         # Match rows containing ANY of the main words
@@ -2729,10 +2752,11 @@ async def grp_search(raw_query: str, limit: int = 5) -> List[dict]:
             seen.add(key)
             unique.append(r)
 
-    # Score by fuzzy similarity
+    # Score by fuzzy similarity (year-aware)
     scored = []
     for r in unique:
-        score = _grp_title_similarity(query_clean, r["clean_title"])
+        score = _grp_title_similarity(title_only, r["clean_title"],
+                                       query_year=query_year, row_year=r.get("year"))
         if score > 0.25:  # threshold
             r["_score"] = score
             scored.append(r)
@@ -2798,8 +2822,9 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
     batch   = 0
 
     # Get a rough idea of the latest msg_id by probing a few high numbers
-    latest_id = 1
-    for probe in [9999, 4999, 1999, 999, 499, 199, 99]:
+    # (plus smaller ones, for chats that don't have hundreds of messages yet)
+    latest_id = None
+    for probe in [9999, 4999, 1999, 999, 499, 199, 99, 49, 24, 9]:
         try:
             fwd = await asyncio.wait_for(
                 bot.forward_message(
@@ -2810,7 +2835,7 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
                 ),
                 timeout=10,
             )
-            latest_id = max(latest_id, probe)
+            latest_id = probe
             try:
                 await fwd.delete()
             except Exception:
@@ -2818,6 +2843,12 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
             break
         except Exception:
             pass
+
+    if latest_id is None:
+        # Every probe missed — likely a small/new chat whose message IDs sit
+        # below our lowest probe point. Give the scan loop real room to work
+        # with instead of collapsing to a single attempt at message_id=1.
+        latest_id = limit + 20
 
     scanned  = 0
     check_id = latest_id
@@ -2915,6 +2946,7 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
         check_id -= 1
         scanned  += 1
         batch    += 1
+        await asyncio.sleep(0.05)  # stay well clear of flood limits over a longer scan
 
         if batch >= 50:
             batch = 0
@@ -2947,7 +2979,7 @@ async def index_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /index_channel <chat_id> [limit]
     Admin command: bulk index existing messages from a group/channel.
-    Default limit: 200 messages. Runs as a background task so it never
+    Default limit: 500 messages. Runs as a background task so it never
     blocks the bot's polling loop or the web service's health checks.
     """
     if not is_admin(update.effective_user.id):
@@ -2970,10 +3002,10 @@ async def index_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid chat ID. Numbers mein dena.", parse_mode="Markdown")
         return
 
-    limit = 200
+    limit = 500
     if len(args) >= 2:
         try:
-            limit = min(int(args[1]), 2000)
+            limit = min(int(args[1]), 5000)
         except ValueError:
             pass
 
@@ -3110,6 +3142,60 @@ async def _grp_send_all_files(update_or_query_message, context, chat_id, grp_res
 
     log_search(search_name, str(user_id))
     add_search_points(user_id)
+
+
+async def _grp_auto_send_or_confirm(context, chat_id, grp_results, raw_name, search_name, user_id):
+    """
+    A high-confidence, unambiguous match (top score >= 0.9 AND every
+    candidate in the result set is the SAME indexed title) skips the manual
+    'Sahi Movie?' step and sends every file straight away. Anything less
+    certain — lower score, or multiple different movies mixed into the
+    results — still asks for confirmation first, same as before.
+    """
+    distinct_titles = {r["clean_title"] for r in grp_results}
+    top_score = grp_results[0]["_score"]
+
+    if top_score >= 0.9 and len(distinct_titles) == 1:
+        title_display = grp_results[0]["clean_title"].title()
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚡ *Exact match mila!*\n\n"
+                f"🎬 *{title_display}*\n"
+                f"🎯 Match: `{int(top_score*100)}%`\n"
+                f"📦 Sending `{len(grp_results)}` file(s)..."
+            ),
+            parse_mode="Markdown",
+        )
+        sent_count = fail_count = 0
+        for r in grp_results:
+            ok = await _grp_send_one_file(context, chat_id, r)
+            if ok:
+                sent_count += 1
+                await asyncio.sleep(0.3)  # flood control
+            else:
+                fail_count += 1
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 6 Web Servers", callback_data=f"grp_fallback_{search_name[:30]}")],
+        ])
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"✅ *Done!*\n\n"
+                f"📤 Sent: `{sent_count}` files\n"
+                + (f"❌ Failed: `{fail_count}`\n" if fail_count else "")
+                + f"\n_Web servers bhi chahiye?_ 👇"
+            ),
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        log_search(search_name, str(user_id))
+        add_search_points(user_id)
+        return
+
+    # Not confident enough to auto-send — fall back to manual confirm.
+    await _grp_offer_confirmation(context, chat_id, grp_results, raw_name, search_name, user_id)
 
 
 async def _grp_offer_confirmation(context, chat_id, grp_results, raw_name, search_name, user_id):
@@ -3257,7 +3343,7 @@ async def _run_full_search(update, context, raw_name: str):
     if grp_results:
         try: await loader.delete()
         except: pass
-        await _grp_offer_confirmation(context, update.effective_chat.id, grp_results, raw_name, search_name, user.id)
+        await _grp_auto_send_or_confirm(context, update.effective_chat.id, grp_results, raw_name, search_name, user.id)
         return
 
     await _run_omdb_fallback(update, context, loader, raw_name, search_name, user.id)
@@ -3354,7 +3440,7 @@ async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     except: pass
 
     if grp_results:
-        await _grp_offer_confirmation(context, chat_id, grp_results, search_name, title, user_id)
+        await _grp_auto_send_or_confirm(context, chat_id, grp_results, search_name, title, user_id)
     else:
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🌐 6 Web Servers", callback_data=f"grp_fallback_{title[:30]}")],
