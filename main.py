@@ -3217,6 +3217,8 @@ async def _grp_send_all_files(update_or_query_message, context, chat_id, grp_res
         f"✅ *Done!*\n\n"
         f"📤 Sent: `{total_sent}` files\n"
         + (f"❌ Failed: `{fail_count}`\n" if fail_count else "")
+        + f"\n📱 *Best playback:* VLC Player use karo (.mkv/H.265 files "
+        + f"default player mein atak sakti hain)\n"
         + f"\n_Web servers bhi chahiye?_ 👇",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb),
@@ -3267,6 +3269,8 @@ async def _grp_auto_send_or_confirm(context, chat_id, grp_results, raw_name, sea
                 f"✅ *Done!*\n\n"
                 f"📤 Sent: `{sent_count}` files\n"
                 + (f"❌ Failed: `{fail_count}`\n" if fail_count else "")
+                + f"\n📱 *Best playback:* VLC Player use karo (.mkv/H.265 files "
+                + f"default player mein atak sakti hain)\n"
                 + f"\n_Web servers bhi chahiye?_ 👇"
             ),
             parse_mode="Markdown",
@@ -5848,7 +5852,62 @@ application.add_handler(CommandHandler("analytics",    analytics_cmd))
 application.add_handler(CommandHandler("sendalert",    sendalert_cmd))
 application.add_handler(CommandHandler("healerlog",     healerlog_cmd))
 application.add_handler(CommandHandler("index_channel", index_channel_cmd))
+async def grptitles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin diagnostic: /grptitles [chat_id] [search term] — lists the
+    ACTUAL clean_title/episode/year stored for indexed files. Use this
+    whenever a search unexpectedly comes back empty despite /grpstats
+    showing files indexed, to see exactly what got stored."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+
+    args = context.args or []
+    chat_filter, term = None, None
+    if args:
+        if args[0].lstrip("-").isdigit():
+            chat_filter = int(args[0])
+            term = " ".join(args[1:]) if len(args) > 1 else None
+        else:
+            term = " ".join(args)
+
+    query  = "SELECT chat_id, clean_title, episode, year, quality, language FROM group_files WHERE 1=1"
+    params = []
+    if chat_filter is not None:
+        query += " AND chat_id = ?"
+        params.append(chat_filter)
+    if term:
+        words = [w for w in re.findall(r'\w+', term.lower()) if len(w) > 2]
+        if words:
+            query += " AND (" + " OR ".join(["clean_title LIKE ?"] * len(words)) + ")"
+            params.extend(f"%{w}%" for w in words)
+    query += " ORDER BY indexed_at DESC LIMIT 30"
+
+    rows = await asyncio.to_thread(_db_grp_fetch, query, tuple(params))
+
+    if not rows:
+        await update.message.reply_text(
+            "📋 *GROUP TITLES*\n\nKoi matching row nahi mili"
+            + (f" chat `{chat_filter}` mein" if chat_filter else "")
+            + (f" for `{term}`" if term else "") + ".\n\n"
+            "_Agar /grpstats mein files > 0 dikh rahi hain lekin ye khaali "
+            "hai, to term/chat_id ka mismatch hai — bina filter try karo._",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = [f"📋 *GROUP TITLES* (showing {len(rows)})", "━━━━━━━━━━━━━━━━━━"]
+    for r in rows:
+        ep = f" `[{r['episode']}]`" if r.get("episode") else ""
+        yr = f" `({r['year']})`" if r.get("year") else ""
+        lines.append(
+            f"🎬 {r['clean_title']}{yr}{ep}\n"
+            f"   `{r['quality'] or 'N/A'}` | `{r['language'] or 'N/A'}` | chat `{r['chat_id']}`"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 application.add_handler(CommandHandler("grpstats",      grpstats_cmd))
+application.add_handler(CommandHandler("grptitles",     grptitles_cmd))
 application.add_handler(CommandHandler("clrindex",      clrindex_cmd))
 
 # ── Admin callbacks ──
