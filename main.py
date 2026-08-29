@@ -405,6 +405,27 @@ def _episode_season_num(episode) -> Optional[int]:
     m = re.match(r'S(\d{1,2})E\d{1,2}', episode or '', re.IGNORECASE)
     return int(m.group(1)) if m else None
 
+_QUALITY_RANK = {"4K": 6, "2160P": 6, "1080P": 5, "720P": 4, "480P": 3, "360P": 2}
+
+def _quality_rank(quality) -> int:
+    return _QUALITY_RANK.get((quality or "").upper(), 1)
+
+def _dedup_keep_best_quality(rows: list) -> list:
+    """When the same title/episode was indexed multiple times at different
+    qualities (re-uploads, multiple release groups), show only the
+    best-quality copy instead of the same content repeated 2-3x — this
+    only affects what a search surfaces, every row stays in the DB."""
+    best_by_key = {}
+    order = []
+    for r in rows:
+        key = (r["clean_title"], r.get("episode") or "")
+        if key not in best_by_key:
+            order.append(key)
+            best_by_key[key] = r
+        elif _quality_rank(r.get("quality")) > _quality_rank(best_by_key[key].get("quality")):
+            best_by_key[key] = r
+    return [best_by_key[k] for k in order]
+
 def get_omdb(title, by_id=False, year=None):
     try:
         param = "i" if by_id else "t"
@@ -520,16 +541,47 @@ async def ai_ask(prompt: str, max_tokens: int = 1000) -> Optional[str]:
         return None
 
 
+async def ai_transcribe_voice(file_path: str) -> Optional[str]:
+    """Transcribe a downloaded voice-message file via Groq's Whisper
+    endpoint (multipart form-data, unlike ai_ask's plain JSON calls)."""
+    if not GROQ_API:
+        return None
+    def _do_request():
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f, "audio/ogg")}
+            data = {"model": "whisper-large-v3"}
+            headers = {"Authorization": f"Bearer {GROQ_API}"}
+            return requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers=headers, files=files, data=data, timeout=30,
+            )
+    try:
+        resp = await asyncio.to_thread(_do_request)
+        if resp.status_code == 200:
+            return (resp.json().get("text") or "").strip() or None
+        print(f"⚠️ Groq transcription error {resp.status_code}: {resp.text[:200]}")
+        return None
+    except Exception as e:
+        print(f"⚠️ Groq transcription exception: {e}")
+        return None
+
+
 # ═══════════════════════════════════════════════════════════════════
 #          GROQ AI — MOVIE FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════
 async def ai_fix_movie_name(raw_name: str) -> str:
     if not GROQ_API: return raw_name
     result = await ai_ask(
-        f"User typed this movie name: '{raw_name}'\n"
-        "Fix spelling/Hinglish and return ONLY the correct English movie title.\n"
+        f"User typed this movie/show name: '{raw_name}'\n"
+        "Fix spelling/Hinglish and return ONLY the correct English title.\n"
+        "Important: only fix clear typos in the SAME title — do not swap it "
+        "for a different, more famous title just because the spelling is "
+        "unusual. A less common but real title (e.g. a newer or regional "
+        "show) is a valid, correct answer even if a bigger franchise has a "
+        "similar-sounding name. If genuinely unsure, keep the input close "
+        "to what was typed rather than guessing the more popular one.\n"
         "Examples: 'rrr' → 'RRR', 'kgf2' → 'KGF Chapter 2', 'andha dhun' → 'Andhadhun'\n"
-        "Return ONLY the movie title, nothing else."
+        "Return ONLY the title, nothing else."
     )
     if result:
         fixed = result.strip().strip('"').strip("'")
@@ -599,6 +651,115 @@ async def ai_compare_movies(movie1: str, movie2: str) -> Optional[str]:
         "Compare on: Story, Acting, Direction, Entertainment, Overall\n"
         "End with a winner recommendation.\nReply in Hinglish. Be fun and opinionated."
     )
+
+# ── Chat Mode: classify free-form messages so they don't all have to be
+#    exact movie titles — "suggest a good thriller" or "sad hoon kuch
+#    dikhao" gets routed to the right AI flow instead of failing as a
+#    literal (and wrong) movie-title search. ──
+_CHAT_MODE_TRIGGERS = re.compile(
+    r'\b(suggest|recommend|batao|dikhao|chahiye|mood|feel|sad|happy|bored|'
+    r'compare|vs|versus|thanks|thank you|hi|hello|hey|kaisi|kaisa|kya hai|'
+    r'help|kuch|good movie|best movie)\b', re.IGNORECASE
+)
+
+def _looks_conversational(text: str) -> bool:
+    """Cheap heuristic gate so an extra AI call only happens for messages
+    that plausibly aren't just a movie title — keeps the overwhelmingly
+    common case (typing a title) exactly as fast as before."""
+    if len(text.split()) > 8:
+        return True
+    if text.strip().endswith("?"):
+        return True
+    return bool(_CHAT_MODE_TRIGGERS.search(text))
+
+async def ai_classify_chat_intent(raw_text: str) -> dict:
+    """Classify a free-form message's intent. Always falls back to
+    movie_search on any failure — never blocks the default search path."""
+    prompt = (
+        f"A user typed this message to a movie-bot: '{raw_text}'\n\n"
+        "Classify the intent as exactly ONE of:\n"
+        "- movie_search: they're naming a specific movie/show to find\n"
+        "- recommend: they want suggestions (e.g. 'suggest a good thriller', "
+        "'recommend something like Inception')\n"
+        "- mood: they're describing a mood/occasion, not naming titles "
+        "(e.g. 'sad hoon', 'family ke saath dekhni hai')\n"
+        "- compare: they're naming exactly two titles to compare\n"
+        "- chat: general conversation, greeting, or a question not about "
+        "finding a specific title (e.g. 'hi', 'thanks', 'how are you')\n\n"
+        "Respond with ONLY a JSON object, nothing else:\n"
+        '{"intent": "<one of the above>", "query": "<the relevant text for that intent>"}\n'
+        "For 'compare', query must be exactly 'Title1 | Title2'. For "
+        "'movie_search', query is the title as typed."
+    )
+    result = await ai_ask(prompt, max_tokens=150)
+    if not result:
+        return {"intent": "movie_search", "query": raw_text}
+    try:
+        cleaned = result.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', cleaned).strip()
+        data = json.loads(cleaned)
+        intent = data.get("intent", "movie_search")
+        if intent not in ("movie_search", "recommend", "mood", "compare", "chat"):
+            intent = "movie_search"
+        return {"intent": intent, "query": data.get("query") or raw_text}
+    except Exception:
+        return {"intent": "movie_search", "query": raw_text}
+
+async def _handle_chat_intent(update, context, intent: str, query: str, raw_name: str):
+    """Route a classified non-search intent to the matching AI flow,
+    reusing the same AI helpers the dedicated /suggest, /mood, /compare
+    commands use."""
+    if intent == "recommend":
+        loader = await update.message.reply_text(
+            "🤖 Soch raha hoon...\n" + progress_bar(0, 4), parse_mode="Markdown")
+        await animate_generic(loader, FRAMES["ai"])
+        result = await ai_recommend(query)
+        try: await loader.delete()
+        except: pass
+        await update.message.reply_text(
+            f"🤖 *AI RECOMMENDATIONS*\n\n{result}\n\n_Type naam to search_ 🔎"
+            if result else "❌ *Kuch nahi mila.*\n\n_GROQ_API add karo._",
+            parse_mode="Markdown")
+
+    elif intent == "mood":
+        loader = await update.message.reply_text(
+            "🎭 Mood samajh raha hun...\n" + progress_bar(0, 4), parse_mode="Markdown")
+        await animate_generic(loader, FRAMES["mood"])
+        result = await ai_mood_recommend(query)
+        try: await loader.delete()
+        except: pass
+        await update.message.reply_text(
+            f"🎭 *MOOD PICKS FOR YOU*\n\n*Tumhara mood:* _{query}_\n━━━━━━━━━━━━━━━━━━\n\n"
+            f"{result}\n\n_Type naam to search_ 🔎"
+            if result else "❌ *Kuch nahi mila.*\n\n_GROQ_API add karo._",
+            parse_mode="Markdown")
+
+    elif intent == "compare":
+        parts = [p.strip() for p in query.split("|") if p.strip()]
+        if len(parts) < 2:
+            await _run_full_search(update, context, raw_name)
+            return
+        loader = await update.message.reply_text(
+            "⚖️ Compare kar raha hoon...\n" + progress_bar(0, 4), parse_mode="Markdown")
+        await animate_generic(loader, FRAMES["ai"])
+        result = await ai_compare_movies(parts[0], parts[1])
+        try: await loader.delete()
+        except: pass
+        await update.message.reply_text(
+            f"⚖️ *{parts[0].title()}* vs *{parts[1].title()}*\n━━━━━━━━━━━━━━━━━━\n\n{result}"
+            if result else "❌ Compare nahi ho paya.",
+            parse_mode="Markdown")
+
+    else:  # "chat" — general conversation
+        result = await ai_ask(
+            f"You are a friendly movie-recommendation Telegram bot. The user "
+            f"said: '{query}'. Reply naturally and briefly in Hinglish (1-2 "
+            f"sentences). If relevant, nudge them toward searching a movie "
+            f"name or using /suggest, /mood, /random. No markdown headers.",
+            max_tokens=150,
+        )
+        await update.message.reply_text(result or "🎬 Movie ka naam bhejo ya /help dekho!")
 
 async def ai_full_review(title: str, year: str, genre: str, plot: str,
                          rating: str, director: str, actors: str, awards: str) -> Optional[str]:
@@ -2386,6 +2547,74 @@ async def analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def insights_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        if not is_admin(update.callback_query.from_user.id):
+            await update.callback_query.answer("🚫 Admin only.", show_alert=True)
+            return
+        await update.callback_query.answer()
+        msg = update.callback_query.message
+    else:
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("🔒 Admin only command.")
+            return
+        msg = update.message
+
+    if not GROQ_API:
+        await msg.reply_text("⚠️ AI insights ke liye GROQ_API chahiye.", parse_mode="Markdown")
+        return
+
+    loader = await msg.reply_text("🤖 Data analyze kar raha hoon...\n" + progress_bar(0, 4), parse_mode="Markdown")
+    await animate_generic(loader, FRAMES["ai"])
+
+    searches = load_json("searches")
+    top_searched = sorted(searches.items(), key=lambda x: x[1], reverse=True)[:15]
+
+    # Which frequently-searched titles have NO group-index match at all?
+    # This is real, measured unmet demand — worth surfacing directly even
+    # before the AI weighs in.
+    idx_rows = await asyncio.to_thread(_db_grp_fetch, "SELECT DISTINCT clean_title FROM group_files LIMIT 500")
+    indexed_titles = {r["clean_title"].lower() for r in idx_rows}
+    unmet = [(t, c) for t, c in top_searched
+             if not any(t.lower() in it or it in t.lower() for it in indexed_titles)]
+
+    heal_stats = {"approved": 0, "rejected": 0, "low_confidence_skip": 0}
+    if _healer:
+        cutoff = time.time() - (30 * 86400)
+        heal_rows = _healer_db_fetch(
+            "SELECT status, COUNT(*) as cnt FROM heal_log WHERE created_at >= ? GROUP BY status", (cutoff,))
+        for r in heal_rows:
+            if r["status"] in heal_stats:
+                heal_stats[r["status"]] = r["cnt"]
+
+    total_users = len(load_json("users"))
+    summary = (
+        f"Total users: {total_users}\n"
+        f"Top searched titles (title: count): {top_searched}\n"
+        f"Searched often but NOT in the group index: {unmet[:8]}\n"
+        f"Healer last 30 days: {heal_stats['approved']} approved, "
+        f"{heal_stats['rejected']} rejected, {heal_stats['low_confidence_skip']} low-confidence skips\n"
+    )
+    ai_result = await ai_ask(
+        f"You are analyzing usage data for a Telegram movie bot, for the admin.\n\n{summary}\n\n"
+        "Give 3-5 short, concrete, actionable recommendations in Hinglish "
+        "(e.g. what to index next, any concerning trend). Short bullet "
+        "list, no long paragraphs.",
+        max_tokens=400,
+    )
+    try: await loader.delete()
+    except: pass
+
+    text = "📊 *AI INSIGHTS*\n━━━━━━━━━━━━━━━━━━\n\n"
+    if unmet:
+        text += "🔥 *High-demand, not indexed:*\n"
+        for t, c in unmet[:5]:
+            text += f"• {t} (`{c}` searches)\n"
+        text += "\n"
+    text += f"🤖 *Suggestions:*\n{ai_result or '_AI unavailable right now._'}"
+    await msg.reply_text(text, parse_mode="Markdown")
+
+
 # ═══════════════════════════════════════════════════════════════════
 #   📦 GROUP FILE INDEX SYSTEM
 #   Bot jis bhi group/channel ka admin hai, wahan uploaded
@@ -2467,9 +2696,9 @@ _RE_LANG     = re.compile(r'\b(Hindi|English|Tamil|Telugu|Malayalam|Kannada|Punj
 _RE_YEAR     = re.compile(r'\b(19|20)\d{2}\b')
 _RE_SE       = re.compile(r'\bS\d{1,2}E\d{1,2}\b', re.I)
 _RE_JUNK     = re.compile(
-    r'\b(NF|AMZN|DSNP|HMAX|HDTV|WEB|DL|DDP\d*\.?\d*|AAC\d*\.?\d*|'
-    r'H\.?26[45]|x26[45]|HEVC|AVC|10bit|HDR|SDR|DD\+?5?\.?1?|'
-    r'BluRay|BRRip|BDRip|CAMRip|mkv|mp4|avi|mov|ts|srt|idx|sub)\b', re.I
+    r'\b(NF|AMZN|DSNP|HMAX|HDTV|WEB|DL|DDP\d*[.\s]?\d*|AAC\d*[.\s]?\d*|'
+    r'H[.\s]?26[45]|x26[45]|AV1|HEVC|AVC|10bit|HDR|SDR|DD\+?\s?5?[.\s]?1?|'
+    r'ESUB|ESUBS|BluRay|BRRip|BDRip|CAMRip|mkv|mp4|avi|mov|ts|srt|idx|sub)\b', re.I
 )
 
 def _parse_caption(caption: str) -> dict:
@@ -2829,6 +3058,11 @@ async def grp_search(raw_query: str, limit: int = 5) -> List[dict]:
             scored = season_only
         # else: that season isn't indexed yet — fall through and show
         # whatever did match rather than returning nothing.
+
+    # Same title/episode indexed multiple times at different qualities —
+    # keep only the best-quality copy so results aren't cluttered with
+    # near-identical entries.
+    scored = _dedup_keep_best_quality(scored)
 
     # Within near-identical scores (same series, different episodes), sort
     # by episode too so results come back in watch order rather than
@@ -3385,6 +3619,11 @@ async def _run_omdb_fallback(update, context, loader, raw_name, search_name, use
     except: pass
 
     title_only, year_hint = _extract_year(search_name)
+    if not year_hint:
+        # search_name is AI-cleaned and may have already had its year
+        # stripped out — raw_name is what the user actually typed, so it's
+        # the authoritative source for whether a year was specified.
+        _, year_hint = _extract_year(raw_name)
     if year_hint:
         data = await asyncio.to_thread(get_omdb, title_only, False, year_hint)
     else:
@@ -3463,15 +3702,24 @@ async def _run_full_search(update, context, raw_name: str):
     )
     await animate_search(loader)
 
-    # ── STEP 1: AI spelling fix ──
-    fixed_name  = await ai_fix_movie_name(raw_name)
-    search_name = fixed_name if fixed_name.lower() != raw_name.lower() else raw_name
+    # Pull the year out of what the user actually typed BEFORE the AI
+    # spelling-fix touches it — the AI treats a trailing year as noise and
+    # drops it while "cleaning" the title (e.g. 'Toxic 2026' -> 'Toxic'),
+    # which was silently defeating year-matching downstream since nothing
+    # ever saw a year to guard on.
+    raw_title_only, year_hint = _extract_year(raw_name)
+
+    # ── STEP 1: AI spelling fix (on the year-stripped title) ──
+    fixed_name  = await ai_fix_movie_name(raw_title_only)
+    search_name = fixed_name if fixed_name.lower() != raw_title_only.lower() else raw_title_only
 
     # ── STEP 2: Show poster/info card ──
-    # A trailing year ("Toxic 2026") is pulled out and sent as OMDB's own
-    # y= param instead of left in the title text — OMDB matches this far
-    # more accurately and it disambiguates same-named movies across years.
-    title_only, year_hint = _extract_year(search_name)
+    # A trailing year ("Toxic 2026") is sent as OMDB's own y= param instead
+    # of left in the title text — OMDB matches this far more accurately
+    # and it disambiguates same-named movies across years.
+    title_only, search_year = _extract_year(search_name)
+    if not year_hint:
+        year_hint = search_year  # AI-fixed text still had a year and raw_name didn't — rare, but keep it
     if year_hint:
         poster_data = await asyncio.to_thread(get_omdb, title_only, False, year_hint)
     else:
@@ -3501,7 +3749,10 @@ async def _run_full_search(update, context, raw_name: str):
         return
 
     # ── STEP 3: OMDB has nothing → try group index directly, else full fallback ──
-    grp_results = await grp_search(search_name, limit=20)
+    # Pass raw_name, not search_name — grp_search does its own AI-fix and
+    # year-recovery internally, but that only works if what it receives as
+    # "the original" still actually has the year in it.
+    grp_results = await grp_search(raw_name, limit=20)
     if grp_results:
         try: await loader.delete()
         except: pass
@@ -3509,6 +3760,55 @@ async def _run_full_search(update, context, raw_name: str):
         return
 
     await _run_omdb_fallback(update, context, loader, raw_name, search_name, user.id)
+
+
+async def voice_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("🚫 You are banned.")
+        return
+    register_user(user)
+    if is_maintenance() and not is_admin(user.id):
+        await update.message.reply_text("🚧 Maintenance mode.")
+        return
+    if not GROQ_API:
+        await update.message.reply_text("🎙 Voice search abhi available nahi hai.", parse_mode="Markdown")
+        return
+
+    loader = await update.message.reply_text("🎙 Sun raha hoon...", parse_mode="Markdown")
+    text = None
+    local_path = None
+    try:
+        tg_file    = await context.bot.get_file(update.message.voice.file_id)
+        local_path = f"/tmp/voice_{user.id}_{update.message.voice.file_id}.ogg"
+        await tg_file.download_to_drive(local_path)
+        text = await ai_transcribe_voice(local_path)
+    except Exception as e:
+        print(f"⚠️ Voice search failed: {e}")
+    finally:
+        if local_path:
+            try: os.remove(local_path)
+            except Exception: pass
+
+    if not text:
+        try:
+            await loader.edit_text(
+                "❌ Awaaz samajh nahi aayi. Phir try karo ya type karo.", parse_mode="Markdown")
+        except Exception: pass
+        return
+
+    try: await loader.delete()
+    except Exception: pass
+    await update.message.reply_text(f"🎙 _Suna:_ \"{text}\"", parse_mode="Markdown")
+
+    if GROQ_API and _looks_conversational(text):
+        intent_data = await ai_classify_chat_intent(text)
+        intent = intent_data.get("intent", "movie_search")
+        if intent != "movie_search":
+            await _handle_chat_intent(update, context, intent, intent_data.get("query", text), text)
+            return
+
+    await _run_full_search(update, context, text)
 
 
 async def movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3530,6 +3830,16 @@ async def movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
         grp_pending_confirm.pop(user.id, None)
         await _run_full_search(update, context, raw_name)
         return
+
+    # Chat Mode: only spend an extra AI call classifying intent when the
+    # message doesn't already look like a plain movie title — keeps normal
+    # searches exactly as fast as before.
+    if GROQ_API and _looks_conversational(raw_name):
+        intent_data = await ai_classify_chat_intent(raw_name)
+        intent = intent_data.get("intent", "movie_search")
+        if intent != "movie_search":
+            await _handle_chat_intent(update, context, intent, intent_data.get("query", raw_name), raw_name)
+            return
 
     await _run_full_search(update, context, raw_name)
 
@@ -3598,7 +3908,7 @@ async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     await animate_search(loader)
 
-    grp_results = await grp_search(title, limit=20)
+    grp_results = await grp_search(search_name, limit=20)
     try: await loader.delete()
     except: pass
 
@@ -5327,6 +5637,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📡 Server Status",       callback_data="adm_srv_status")],
         [InlineKeyboardButton("🔧 Healer Log",          callback_data="adm_healerlog")],
         [InlineKeyboardButton("📊 Analytics Dashboard", callback_data="cmd_analytics")],
+        [InlineKeyboardButton("🤖 AI Insights",         callback_data="cmd_insights")],
     ]
     sent = await update.message.reply_text(
         text, parse_mode="Markdown",
@@ -5695,6 +6006,7 @@ async def adm_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📡 Server Status",       callback_data="adm_srv_status")],
         [InlineKeyboardButton("🔧 Healer Log",          callback_data="adm_healerlog")],
         [InlineKeyboardButton("📊 Analytics Dashboard", callback_data="cmd_analytics")],
+        [InlineKeyboardButton("🤖 AI Insights",         callback_data="cmd_insights")],
     ]
     sent = await query.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
     asyncio.create_task(auto_delete(sent, 60))
@@ -5733,7 +6045,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"ℹ️ *CINEBOT HELP*\n\n"
         f"🤖 *AI Status:* {ai_status}\n"
         f"🔧 *Healer:* {healer_status}\n\n"
-        "🔎 *Movie Search:* Seedha naam type karo\n\n"
+        "🔎 *Movie Search:* Seedha naam type karo\n"
+        "🎙 *Voice Search:* Voice message bhejo, bot sun ke dhundega\n"
+        "💬 *Chat Mode:* Bina command ke bhi poocho — \"sad hoon kuch dikhao\", "
+        "\"RRR vs KGF compare\" jaisa kuch bhi likho\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "🤖 *AI Features*\n"
         "🎬 /movieinfo    — TMDB rich movie info\n"
@@ -5771,11 +6086,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👑 *Admin Only*\n"
         "👑 /admin        — Admin panel\n"
         "📊 /analytics    — Analytics dashboard\n"
+        "🤖 /insights     — AI-generated usage insights\n"
         "📡 /checkservers — Manual server health check\n"
         "📊 /serverstats  — Uptime stats\n"
         "🔧 /healerlog    — Domain heal history\n"
         "📦 /index_channel — Group ka index banao\n"
         "📊 /grpstats     — Index stats\n"
+        "🔍 /grptitles    — See actual stored titles (debug search misses)\n"
         "🗑 /clrindex     — Index clear karo\n"
         "📢 /sendalert    — Alert all users\n"
         "👑 /addadmin     — Add admin\n"
@@ -5922,6 +6239,7 @@ application.add_handler(CommandHandler("trivia",       trivia_cmd))
 application.add_handler(CommandHandler(["checkservers","checkserver"], checkservers_cmd))
 application.add_handler(CommandHandler("serverstats",  serverstats_cmd))
 application.add_handler(CommandHandler("analytics",    analytics_cmd))
+application.add_handler(CommandHandler("insights",     insights_cmd))
 application.add_handler(CommandHandler("sendalert",    sendalert_cmd))
 application.add_handler(CommandHandler("healerlog",     healerlog_cmd))
 application.add_handler(CommandHandler("index_channel", index_channel_cmd))
@@ -5998,6 +6316,7 @@ application.add_handler(CallbackQueryHandler(adm_listadmins_cb,     pattern="^ad
 application.add_handler(CallbackQueryHandler(adm_rmadmin_cb,        pattern="^adm_rmadmin_"))
 application.add_handler(CallbackQueryHandler(adm_healerlog_cb,      pattern="^adm_healerlog$"))
 application.add_handler(CallbackQueryHandler(analytics_cmd,         pattern="^cmd_analytics$"))
+application.add_handler(CallbackQueryHandler(insights_cmd,          pattern="^cmd_insights$"))
 
 # ── Server checker callbacks ──
 application.add_handler(CallbackQueryHandler(srvchk_refresh_cb,      pattern="^srvchk_refresh$"))
@@ -6055,6 +6374,9 @@ application.add_handler(MessageHandler(
     (filters.VIDEO | filters.Document.ALL) & filters.ChatType.GROUPS,
     grp_file_handler,
 ))
+
+# ── Voice search (transcribe then run through the same search pipeline) ──
+application.add_handler(MessageHandler(filters.VOICE, voice_search_handler))
 
 # ── Movie search (last — catch-all) ──
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, movie))
