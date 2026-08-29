@@ -1036,20 +1036,40 @@ async def _send_movie_card(update, context, data, reply_to=None, is_search=False
         if "Rotten Tomatoes" in r.get("Source", ""):
             rt_score = r["Value"]
 
+    tmdb_hit = None
+    if ((not poster or poster == "N/A") or (not director or director == "N/A")) and TMDB_API:
+        try:
+            r = await asyncio.to_thread(
+                requests.get,
+                f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API}&query={quote(title)}",
+                timeout=5
+            )
+            results = r.json().get("results", [])
+            if results:
+                tmdb_hit = results[0]
+        except Exception:
+            tmdb_hit = None
+
     if not poster or poster == "N/A":
         poster = None
-        if TMDB_API:
-            try:
-                r = await asyncio.to_thread(
-                    requests.get,
-                    f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API}&query={quote(title)}",
-                    timeout=5
-                )
-                results = r.json().get("results", [])
-                if results and results[0].get("poster_path"):
-                    poster = f"https://image.tmdb.org/t/p/w500{results[0]['poster_path']}"
-            except Exception:
-                poster = None
+        if tmdb_hit and tmdb_hit.get("poster_path"):
+            poster = f"https://image.tmdb.org/t/p/w500{tmdb_hit['poster_path']}"
+
+    # OMDB frequently has no crew data for newer/regional titles — TMDB
+    # usually does, so fall back to it when Director comes back empty.
+    if (not director or director == "N/A") and tmdb_hit and TMDB_API:
+        try:
+            r2 = await asyncio.to_thread(
+                requests.get,
+                f"https://api.themoviedb.org/3/movie/{tmdb_hit['id']}/credits?api_key={TMDB_API}",
+                timeout=5
+            )
+            crew = r2.json().get("crew", [])
+            directors = [c["name"] for c in crew if c.get("job") == "Director"]
+            if directors:
+                director = ", ".join(directors[:3])
+        except Exception:
+            pass
 
     ratings_db  = load_json("ratings")
     movie_rates = ratings_db.get(title, {})
@@ -2818,6 +2838,26 @@ async def grp_search(raw_query: str, limit: int = 5) -> List[dict]:
     return scored[:limit]
 
 
+async def _grp_closest_miss(query_title: str) -> Optional[dict]:
+    """When grp_search finds nothing above the match threshold, this peeks
+    at the single closest stored title regardless of threshold — purely so
+    a failed search can show a diagnostic hint ('closest match was X at
+    Y%') instead of a flat 'not found' with no clue why."""
+    rows = await asyncio.to_thread(
+        _db_grp_fetch, "SELECT clean_title, episode, year FROM group_files LIMIT 1000"
+    )
+    if not rows:
+        return None
+    title_only, _ = _extract_year(query_title.lower().strip())
+    title_only, _ = _extract_season(title_only)
+    best, best_score = None, 0.0
+    for r in rows:
+        s = _grp_title_similarity(title_only, r["clean_title"])
+        if s > best_score:
+            best_score, best = s, r
+    return {"title": best["clean_title"], "score": best_score} if best else None
+
+
 # ── Build Telegram direct link ──
 def _grp_direct_link(chat_id: int, message_id: int) -> str:
     """
@@ -3352,8 +3392,14 @@ async def _run_omdb_fallback(update, context, loader, raw_name, search_name, use
     if not data or data.get("Response") == "False":
         if year_hint:
             data = await asyncio.to_thread(get_omdb, title_only)
+            if (data and data.get("Response") == "True"
+                    and not _year_close_enough(year_hint, data.get("Year"))):
+                data = None  # same title, wrong film — don't present it as a match
         if not data or data.get("Response") == "False":
             data = await asyncio.to_thread(get_omdb, raw_name)
+            if (year_hint and data and data.get("Response") == "True"
+                    and not _year_close_enough(year_hint, data.get("Year"))):
+                data = None
 
     if not data or data.get("Response") == "False":
         results = await asyncio.to_thread(get_omdb_search, title_only, year_hint)
@@ -3380,9 +3426,12 @@ async def _run_omdb_fallback(update, context, loader, raw_name, search_name, use
                 return
 
     if not data or data.get("Response") == "False":
+        closest = await _grp_closest_miss(raw_name)
+        hint = (f"\n🔍 _Group mein sabse close: '{closest['title']}' (`{int(closest['score']*100)}%` match)_\n"
+                if closest and closest["score"] > 0.1 else "")
         try:
             await loader.edit_text(
-                f"❌ *'{raw_name}'* nahi mili\n\n"
+                f"❌ *'{raw_name}'* nahi mili\n{hint}\n"
                 f"💡 *Try karo:*\n• /plotsearch\n• /suggest\n• /mood\n• /random",
                 parse_mode="Markdown"
             )
@@ -3393,6 +3442,18 @@ async def _run_omdb_fallback(update, context, loader, raw_name, search_name, use
     except: pass
     await _send_movie_card(update, context, data, is_search=True)
 
+
+def _year_close_enough(requested: str, actual, tolerance: int = 1) -> bool:
+    """True if actual's year is within `tolerance` of requested (handles
+    OMDB listing a slightly different year due to release-date/region
+    quirks) — used to stop a year-less fallback lookup from silently
+    handing back a same-titled but completely different-year film."""
+    try:
+        req = int(str(requested)[:4])
+        act = int(str(actual)[:4])
+        return abs(req - act) <= tolerance
+    except (TypeError, ValueError):
+        return True  # can't parse — don't block on it
 
 async def _run_full_search(update, context, raw_name: str):
     """Search pipeline: poster/info card only. Group video fetch happens on 'Direct Video' button tap."""
@@ -3421,8 +3482,17 @@ async def _run_full_search(update, context, raw_name: str):
             # Maybe OMDB's listed year is off by one from what the user typed
             # (release-date/region quirks) — retry title alone before giving up.
             poster_data = await asyncio.to_thread(get_omdb, title_only)
+            if (poster_data and poster_data.get("Response") == "True"
+                    and not _year_close_enough(year_hint, poster_data.get("Year"))):
+                # Same title, wrong film (e.g. an old movie sharing the name) —
+                # don't silently present this as the answer. Let it fall
+                # through to "not found" instead of misleading the user.
+                poster_data = None
         if not poster_data or poster_data.get("Response") == "False":
             poster_data = await asyncio.to_thread(get_omdb, raw_name)
+            if (year_hint and poster_data and poster_data.get("Response") == "True"
+                    and not _year_close_enough(year_hint, poster_data.get("Year"))):
+                poster_data = None
 
     if poster_data and poster_data.get("Response") == "True":
         try: await loader.delete()
@@ -3535,12 +3605,15 @@ async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     if grp_results:
         await _grp_auto_send_or_confirm(context, chat_id, grp_results, search_name, title, user_id)
     else:
+        closest = await _grp_closest_miss(title)
+        hint = (f"\n🔍 _Sabse close jo mila: '{closest['title']}' (`{int(closest['score']*100)}%` match)_\n"
+                if closest and closest["score"] > 0.1 else "")
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🌐 6 Web Servers", callback_data=f"grp_fallback_{title[:30]}")],
         ])
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"❌ *'{title}'* group mein nahi mili.\n\n_Web servers try karo 👇_",
+            text=f"❌ *'{title}'* group mein nahi mili.\n{hint}\n_Web servers try karo 👇_",
             parse_mode="Markdown",
             reply_markup=kb,
         )
@@ -6008,6 +6081,13 @@ def _start_render_port_binder():
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"CineBot is running.")
+        def do_HEAD(self):
+            # Uptime monitors (UptimeRobot etc.) commonly use HEAD instead of
+            # GET — without this, BaseHTTPRequestHandler's default response
+            # is 501 Not Implemented, which reads as "service down" to them.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
         def log_message(self, *args):
             pass  # keep Render's log stream focused on the bot, not HTTP noise
 
