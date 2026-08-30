@@ -78,6 +78,57 @@ if GROQ_API:
 # ═══════════════════════════════════════════════════════════════════
 #                      PERSISTENT STORAGE
 # ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#                      PERSISTENT STORAGE
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Turso (persistent SQLite) — optional, falls back to local files ──
+# Render's free tier has ephemeral disk: local .json/.db files get wiped
+# on every restart/redeploy. If TURSO_DATABASE_URL + TURSO_AUTH_TOKEN are
+# set, EVERYTHING below (all the JSON stores, plus the healer and group
+# index SQLite DBs further down) is kept in Turso instead — same
+# key/value shape, just persisted remotely. If Turso isn't configured (or
+# the libsql package isn't installed), everything falls back to local
+# files exactly as before — this can never make things worse than the
+# pre-Turso behavior, only better once it's set up.
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL")
+TURSO_AUTH_TOKEN   = os.getenv("TURSO_AUTH_TOKEN")
+_TURSO_ENABLED = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN)
+if _TURSO_ENABLED:
+    try:
+        import libsql
+    except ImportError:
+        print("⚠️ TURSO_DATABASE_URL is set but the 'libsql' package isn't "
+              "installed (pip install libsql) — falling back to local "
+              "files for now. Data will NOT persist across redeploys "
+              "until this is fixed.")
+        _TURSO_ENABLED = False
+
+def _sqlite_connect(local_file: str):
+    """DB-API connection: Turso if configured, else the local file."""
+    if _TURSO_ENABLED:
+        return libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+    return sqlite3.connect(local_file)
+
+_json_store_lock = threading.Lock()
+JSON_STORE_FILE = "json_store.db"  # only relevant as a Turso table name holder
+
+def _json_store_init():
+    if not _TURSO_ENABLED:
+        return
+    with _json_store_lock:
+        con = _sqlite_connect(JSON_STORE_FILE)
+        try:
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS json_store "
+                "(key TEXT PRIMARY KEY, data TEXT, updated_at REAL)"
+            )
+            con.commit()
+        finally:
+            con.close()
+
+_json_store_init()
+
 FILES = {
     "servers":     "servers.json",
     "maintenance": "maintenance.json",
@@ -106,8 +157,24 @@ DEFAULT_SERVERS = {
 }
 
 def load_json(key, default=None):
-    fp = FILES[key]
     if default is None: default = {}
+    if _TURSO_ENABLED:
+        try:
+            with _json_store_lock:
+                con = _sqlite_connect(JSON_STORE_FILE)
+                try:
+                    cur = con.execute("SELECT data FROM json_store WHERE key=?", (key,))
+                    row = cur.fetchone()
+                finally:
+                    con.close()
+            if row and row[0]:
+                return json.loads(row[0])
+        except Exception as e:
+            print(f"⚠️ load_json (Turso) error [{key}]: {e}")
+        save_json(key, default)
+        return default.copy() if isinstance(default, dict) else default
+
+    fp = FILES[key]
     if os.path.exists(fp):
         try:
             with open(fp) as f: return json.load(f)
@@ -117,6 +184,23 @@ def load_json(key, default=None):
     return default.copy() if isinstance(default, dict) else default
 
 def save_json(key, data):
+    if _TURSO_ENABLED:
+        try:
+            with _json_store_lock:
+                con = _sqlite_connect(JSON_STORE_FILE)
+                try:
+                    con.execute(
+                        "INSERT INTO json_store (key, data, updated_at) VALUES (?,?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
+                        (key, json.dumps(data), time.time()),
+                    )
+                    con.commit()
+                finally:
+                    con.close()
+            return
+        except Exception as e:
+            print(f"⚠️ save_json (Turso) error [{key}]: {e}")
+            return
     with open(FILES[key], "w") as f: json.dump(data, f, indent=2)
 
 def load_servers():
@@ -374,6 +458,23 @@ def get_badge(points):
     if points >= 200:  return "🥈 Silver"
     if points >= 100:  return "🥉 Bronze"
     return "🌱 Newbie"
+
+def _role_badge(uid) -> str:
+    """Owner gets a unique crown badge (only ever the one owner, ADMIN_ID).
+    Any admin — temporary or permanent — gets a shield badge for as long
+    as they hold admin status. This checks is_owner/is_admin live every
+    call, so the badge appears the moment someone is made admin and
+    disappears the moment that access is removed or expires — no separate
+    flag to add, set, or clean up anywhere else."""
+    try:
+        uid_int = int(uid)
+    except (TypeError, ValueError):
+        return ""
+    if is_owner(uid_int):
+        return "👑 "
+    if is_admin(uid_int):
+        return "🛡️ "
+    return ""
 
 def build_star_bar(rating):
     try:
@@ -1083,11 +1184,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📜 History",     callback_data="cmd_history"),
          InlineKeyboardButton("👥 Refer",       callback_data="cmd_refer")],
     ] + admin_btn
+    role = _role_badge(user.id)
     await update.message.reply_text(
         f"╔═══════════════════════╗\n"
         f"║   🎬  *C I N E B O T*  v10  ║\n"
         f"╚═══════════════════════╝\n\n"
-        f"✨ *Welcome, {user.first_name}!*\n\n"
+        f"✨ *Welcome, {role}{user.first_name}!*\n\n"
         f"┌─────────────────────┐\n"
         f"│  {badge}\n"
         f"│  ⭐ `{points}` Points  •  👥 `{refs}` Refers\n"
@@ -1677,6 +1779,11 @@ except NameError:
 HEALER_DB_FILE = "healer_v6.db"
 _healer_db_lock = threading.Lock()
 
+# Turso connection setup (_sqlite_connect, _TURSO_ENABLED) lives near the
+# top of the file, before FILES/load_json/save_json — those run at
+# module-import time (bot_servers = load_servers()) so the connection
+# helper has to exist before this point too. Reused here unchanged.
+
 # Module-level healer instance, set by post_init() once the bot starts.
 try:
     _healer
@@ -1686,7 +1793,7 @@ except NameError:
 
 def _healer_init_db():
     with _healer_db_lock:
-        con = sqlite3.connect(HEALER_DB_FILE)
+        con = _sqlite_connect(HEALER_DB_FILE)
         con.executescript("""
             CREATE TABLE IF NOT EXISTS heal_log (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1725,7 +1832,7 @@ _healer_init_db()
 
 def _healer_db_execute(query: str, params: tuple = ()):
     with _healer_db_lock:
-        con = sqlite3.connect(HEALER_DB_FILE)
+        con = _sqlite_connect(HEALER_DB_FILE)
         try:
             con.execute(query, params)
             con.commit()
@@ -1735,7 +1842,7 @@ def _healer_db_execute(query: str, params: tuple = ()):
 
 def _healer_db_fetch(query: str, params: tuple = ()) -> list:
     with _healer_db_lock:
-        con = sqlite3.connect(HEALER_DB_FILE)
+        con = _sqlite_connect(HEALER_DB_FILE)
         try:
             cur = con.execute(query, params)
             cols = [d[0] for d in cur.description]
@@ -2647,7 +2754,7 @@ grp_awaiting_retry: dict = {}
 # ── DB init ──
 def _grp_init_db():
     with _grp_db_lock:
-        con = sqlite3.connect(GRP_INDEX_DB)
+        con = _sqlite_connect(GRP_INDEX_DB)
         con.executescript("""
             CREATE TABLE IF NOT EXISTS group_files (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2874,7 +2981,7 @@ async def grp_index_message(message) -> bool:
 
 def _db_grp_execute(query: str, params: tuple = ()):
     with _grp_db_lock:
-        con = sqlite3.connect(GRP_INDEX_DB)
+        con = _sqlite_connect(GRP_INDEX_DB)
         try:
             con.execute(query, params)
             con.commit()
@@ -2883,7 +2990,7 @@ def _db_grp_execute(query: str, params: tuple = ()):
 
 def _db_grp_fetch(query: str, params: tuple = ()) -> list:
     with _grp_db_lock:
-        con = sqlite3.connect(GRP_INDEX_DB)
+        con = _sqlite_connect(GRP_INDEX_DB)
         try:
             cur = con.execute(query, params)
             cols = [d[0] for d in cur.description]
@@ -4624,11 +4731,12 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if next_line is None:
         next_line = "📈 *Next:* 💎 *MAX BADGE!* 🎉"
 
+    role = _role_badge(update.effective_user.id)
     await update.message.reply_text(
         f"╔═══════════════════╗\n"
         f"   📊  *MY STATS*\n"
         f"╚═══════════════════╝\n"
-        f"👤 *{update.effective_user.full_name}*\n"
+        f"👤 {role}*{update.effective_user.full_name}*\n"
         f"🏆 {badge}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⭐ Points: `{pts}`   🔎 Searches: `{srch}`\n"
@@ -4672,10 +4780,11 @@ async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     for i, u in enumerate(sorted_users):
         badge = get_badge(u.get("points", 0))
+        role  = _role_badge(u.get("id"))
         raw_name = u.get("name", "Unknown")[:15]
         name = re.sub(r'([*_`\[\]()])', r'\\\1', raw_name)
         pts  = u.get("points", 0)
-        line = f"{medals[i]} *{name}* — `{pts}` pts {badge}\n"
+        line = f"{medals[i]} {role}*{name}* — `{pts}` pts {badge}\n"
         text += ("┃ " + line) if i < 3 else line
     text += "━━━━━━━━━━━━━━━━━━━━━━\n_Search=+10 | Refer=+50 | Rate=+5_ 🎯"
     await update.message.reply_text(text, parse_mode="Markdown")

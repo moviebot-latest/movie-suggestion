@@ -7,3 +7,4 @@ aiohttp==3.11.11
 requests
 beautifulsoup4
 groq
+libsql
