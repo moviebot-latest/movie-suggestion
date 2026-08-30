@@ -78,9 +78,6 @@ if GROQ_API:
 # ═══════════════════════════════════════════════════════════════════
 #                      PERSISTENT STORAGE
 # ═══════════════════════════════════════════════════════════════════
-# ═══════════════════════════════════════════════════════════════════
-#                      PERSISTENT STORAGE
-# ═══════════════════════════════════════════════════════════════════
 
 # ── Turso (persistent SQLite) — optional, falls back to local files ──
 # Render's free tier has ephemeral disk: local .json/.db files get wiped
@@ -4888,7 +4885,7 @@ async def quiz_answer_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════
 def _upcom_init_db():
     db_path = os.environ.get("DB_PATH", "movies.db")
-    con = sqlite3.connect(db_path)
+    con = _sqlite_connect(db_path)
     cur = con.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS upcom_reminders (
@@ -4919,13 +4916,13 @@ _upcom_init_db()
 _DB_PATH = os.environ.get("DB_PATH", "movies.db")
 
 def _db_fetch(query: str, params: tuple = (), db: str = None) -> list:
-    con = sqlite3.connect(db or _DB_PATH)
+    con = _sqlite_connect(db or _DB_PATH)
     try: rows = con.execute(query, params).fetchall()
     finally: con.close()
     return rows
 
 def _db_execute(query: str, params: tuple = (), db: str = None) -> int:
-    con = sqlite3.connect(db or _DB_PATH)
+    con = _sqlite_connect(db or _DB_PATH)
     try:
         cur = con.execute(query, params)
         con.commit()
