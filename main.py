@@ -1620,11 +1620,25 @@ async def castanalysis_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await loader.delete()
     except: pass
     if result:
-        await query.message.reply_text(
-            f"╔══════════════════════════╗\n║  🌟  *CAST ANALYSIS*  ║\n╚══════════════════════════╝\n\n"
-            f"🎬 *{md['title']}* ({md['year']})\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"{result}\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)",
-            parse_mode="Markdown")
+        text = (
+            f"╔══════════════════════════╗\n"
+            f"║  🌟  CAST ANALYSIS  ║\n"
+            f"╚══════════════════════════╝\n\n"
+            f"🎬 {md['title']} ({md['year']})\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"{result}\n\n"
+            f"Powered by @LatesttMoviebot"
+        )
+        try:
+            await query.message.reply_text(text, parse_mode=None)
+        except Exception as e:
+            print(f"⚠️ Cast analysis send failed: {e}")
+            try:
+                await query.message.reply_text(
+                    f"🌟 CAST ANALYSIS\n\n{result}\n\nPowered by @LatesttMoviebot"
+                )
+            except Exception as e2:
+                print(f"⚠️ Cast analysis fallback failed: {e2}")
     else:
         await query.message.reply_text("❌ Cast analysis nahi hua.", parse_mode="Markdown")
 
