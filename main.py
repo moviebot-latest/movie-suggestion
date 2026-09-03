@@ -6955,6 +6955,18 @@ def _start_render_port_binder():
             self.end_headers()
             self.wfile.write(body)
 
+        def do_HEAD(self):
+            # UptimeRobot HTTP monitors may use HEAD requests.
+            # BaseHTTPRequestHandler returns 501 for HEAD unless implemented.
+            if self.path in ("/", "/health", "/healthz"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
+
         def do_GET(self):
             if self.path in ("/", "/health", "/healthz"):
                 html = """<!doctype html>
