@@ -2838,6 +2838,21 @@ for _gid in _RAW_GROUP_IDS.split(","):
         except ValueError:
             pass
 
+# Groups added by the Owner with /add_group are persisted in the bot's JSON store.
+# Environment GROUP_IDS remains supported as the initial/static source.
+try:
+    _saved_watched_groups = load_json("watched_groups", [])
+    if isinstance(_saved_watched_groups, list):
+        for _gid in _saved_watched_groups:
+            try:
+                _gid = int(_gid)
+                if _gid not in WATCHED_GROUP_IDS:
+                    WATCHED_GROUP_IDS.append(_gid)
+            except (TypeError, ValueError):
+                pass
+except Exception:
+    pass
+
 GRP_INDEX_DB = "group_index.db"
 _grp_db_lock = threading.Lock()
 
@@ -3588,6 +3603,211 @@ async def grpstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"💬 Chat `{r['chat_id']}`\n   Files: `{r['cnt']}` | Last: _{last_ts}_\n\n"
     text += f"_Watched Groups: {WATCHED_GROUP_IDS or 'All (GROUP_IDS not set)'}_"
     await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ── Group management commands ──
+async def add_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: /add_group <group_id>
+    Adds a group to the live watched list and persists it across restarts.
+    """
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("👑 Owner only.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /add_group <group_id>\nExample: /add_group -1001234567890")
+        return
+
+    try:
+        chat_id = int(args[0])
+    except (TypeError, ValueError):
+        await update.message.reply_text("❌ Invalid group ID. Example: /add_group -1001234567890")
+        return
+
+    if chat_id in WATCHED_GROUP_IDS:
+        await update.message.reply_text(f"ℹ️ Group `{chat_id}` already added.", parse_mode="Markdown")
+        return
+
+    WATCHED_GROUP_IDS.append(chat_id)
+    try:
+        saved = load_json("watched_groups", [])
+        if not isinstance(saved, list):
+            saved = []
+        if chat_id not in [int(x) for x in saved if str(x).lstrip("-").isdigit()]:
+            saved.append(chat_id)
+        save_json("watched_groups", saved)
+        await update.message.reply_text(
+            f"✅ Group `{chat_id}` added.\n\n"
+            "New video/document messages will now be indexed automatically.\n"
+            "For old messages, use `/index_channel <group_id> <limit>`. ",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        # Keep runtime state consistent if persistence fails.
+        try:
+            WATCHED_GROUP_IDS.remove(chat_id)
+        except ValueError:
+            pass
+        await update.message.reply_text(f"❌ Could not save group: {e}")
+
+
+
+async def all_groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner/Admin: /all_groups — show all currently watched groups."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+
+    groups = list(dict.fromkeys(WATCHED_GROUP_IDS))
+    if not groups:
+        await update.message.reply_text(
+            "📭 Koi watched group nahi hai.\n"
+            "Owner `/add_group <group_id>` se group add kar sakta hai."
+        )
+        return
+
+    lines = ["📋 *Watched Groups*", ""]
+    for i, chat_id in enumerate(groups, 1):
+        lines.append(f"{i}. `{chat_id}`")
+    lines.append("")
+    lines.append(f"Total: `{len(groups)}`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def remove_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: /remove_group <group_id> — stop watching a group."""
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("👑 Owner only.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /remove_group <group_id>")
+        return
+
+    try:
+        chat_id = int(args[0])
+    except (TypeError, ValueError):
+        await update.message.reply_text("❌ Invalid group ID.")
+        return
+
+    if chat_id not in WATCHED_GROUP_IDS:
+        await update.message.reply_text(f"ℹ️ Group `{chat_id}` watched list me nahi hai.", parse_mode="Markdown")
+        return
+
+    # Remove from the live list.
+    WATCHED_GROUP_IDS[:] = [gid for gid in WATCHED_GROUP_IDS if gid != chat_id]
+
+    # Persist the dynamic /add_group list.
+    try:
+        saved = load_json("watched_groups", [])
+        if not isinstance(saved, list):
+            saved = []
+        saved_ids = []
+        for item in saved:
+            try:
+                gid = int(item)
+                if gid != chat_id and gid not in saved_ids:
+                    saved_ids.append(gid)
+            except (TypeError, ValueError):
+                pass
+        save_json("watched_groups", saved_ids)
+
+        # GROUP_IDS is environment/static config, so removing a group from
+        # the runtime list does not edit Render environment variables.
+        await update.message.reply_text(
+            f"✅ Group `{chat_id}` removed from watched list.\n"
+            "Is group ke naye messages ab auto-index nahi honge.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        # Restore runtime state if persistence fails.
+        if chat_id not in WATCHED_GROUP_IDS:
+            WATCHED_GROUP_IDS.append(chat_id)
+        await update.message.reply_text(f"❌ Could not save group removal: {e}")
+
+async def clear_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /clear_group <group_id> — remove all index rows for one group."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /clear_group <group_id>")
+        return
+
+    try:
+        chat_id = int(args[0])
+    except (TypeError, ValueError):
+        await update.message.reply_text("❌ Invalid group ID.")
+        return
+
+    try:
+        before = await asyncio.to_thread(
+            _db_grp_fetch,
+            "SELECT COUNT(*) AS cnt FROM group_files WHERE chat_id=?",
+            (chat_id,),
+        )
+        count = int(before[0]["cnt"]) if before else 0
+        await asyncio.to_thread(
+            _db_grp_execute,
+            "DELETE FROM group_files WHERE chat_id=?",
+            (chat_id,),
+        )
+        await update.message.reply_text(
+            f"🗑 Group `{chat_id}` ka index clear ho gaya.\n"
+            f"Removed entries: `{count}`",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def delete_index_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /delete_index <group_id> <message_id> — remove one index row only."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Usage: /delete_index <group_id> <message_id>")
+        return
+
+    try:
+        chat_id = int(args[0])
+        message_id = int(args[1])
+    except (TypeError, ValueError):
+        await update.message.reply_text("❌ Group ID and message ID must be numbers.")
+        return
+
+    try:
+        rows = await asyncio.to_thread(
+            _db_grp_fetch,
+            "SELECT id FROM group_files WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id),
+        )
+        if not rows:
+            await update.message.reply_text(
+                f"ℹ️ Index entry nahi mila for `{chat_id}` / `{message_id}`.",
+                parse_mode="Markdown",
+            )
+            return
+
+        await asyncio.to_thread(
+            _db_grp_execute,
+            "DELETE FROM group_files WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id),
+        )
+        await update.message.reply_text(
+            f"✅ Index entry deleted: `{chat_id}` / `{message_id}`\n"
+            "Telegram ka original message is command se delete nahi hota.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
 
 # ── /clrindex — clear index ──
@@ -6263,6 +6483,16 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💬 *Chat Mode:* Bina command ke bhi poocho — \"sad hoon kuch dikhao\", "
         "\"RRR vs KGF compare\" jaisa kuch bhi likho\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
+        "👑 *Group Management*\n"
+        "➕ /add_group <group_id> — Add group (Owner)\n"
+        "📋 /all_groups — List watched groups (Admin)\n"
+        "➖ /remove_group <group_id> — Remove group (Owner)\n"
+        "▶️ /start_group <group_id> — Start group (Admin)\n"
+        "🛑 /stop_group <group_id> — Stop group (Admin)\n"
+        "🗑 /clear_group <group_id> — Clear group index (Admin)\n"
+        "❌ /delete_index <group_id> <message_id> — Delete one index (Admin)\n"
+        "📥 /index_channel <group_id> <limit> — Index old messages (Admin)\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
         "🤖 *AI Features*\n"
         "🎬 /movieinfo    — TMDB rich movie info\n"
         "📝 /fullreview   — Detailed AI review\n"
@@ -6512,6 +6742,11 @@ async def grptitles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 application.add_handler(CommandHandler("grpstats",      grpstats_cmd))
 application.add_handler(CommandHandler("grptitles",     grptitles_cmd))
+application.add_handler(CommandHandler("add_group",     add_group_cmd))
+application.add_handler(CommandHandler("all_groups",    all_groups_cmd))
+application.add_handler(CommandHandler("remove_group",  remove_group_cmd))
+application.add_handler(CommandHandler("clear_group",   clear_group_cmd))
+application.add_handler(CommandHandler("delete_index",  delete_index_cmd))
 application.add_handler(CommandHandler("clrindex",      clrindex_cmd))
 
 # ── Admin callbacks ──
