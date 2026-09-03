@@ -2853,6 +2853,19 @@ try:
 except Exception:
     pass
 
+# Temporarily stopped groups: keep DB index, hide results, pause auto-indexing.
+STOPPED_GROUP_IDS = set()
+try:
+    _saved_stopped_groups = load_json("stopped_groups", [])
+    if isinstance(_saved_stopped_groups, list):
+        for _gid in _saved_stopped_groups:
+            try:
+                STOPPED_GROUP_IDS.add(int(_gid))
+            except (TypeError, ValueError):
+                pass
+except Exception:
+    pass
+
 GRP_INDEX_DB = "group_index.db"
 _grp_db_lock = threading.Lock()
 
@@ -3234,6 +3247,11 @@ async def grp_search(raw_query: str, limit: int = 5) -> List[dict]:
     if not all_rows:
         return []
 
+    if STOPPED_GROUP_IDS:
+        all_rows = [r for r in all_rows if int(r["chat_id"]) not in STOPPED_GROUP_IDS]
+    if not all_rows:
+        return []
+
     # Deduplicate by (chat_id, message_id)
     seen   = set()
     unique = []
@@ -3339,6 +3357,8 @@ async def grp_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = msg.chat.id
     if WATCHED_GROUP_IDS and chat_id not in WATCHED_GROUP_IDS:
+        return
+    if chat_id in STOPPED_GROUP_IDS:
         return
     if not (msg.video or msg.document):
         return
@@ -3726,6 +3746,69 @@ async def remove_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat_id not in WATCHED_GROUP_IDS:
             WATCHED_GROUP_IDS.append(chat_id)
         await update.message.reply_text(f"❌ Could not save group removal: {e}")
+
+async def stop_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /stopgroup <group_id> — pause auto-indexing and hide search results."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /stopgroup <group_id>")
+        return
+    try:
+        chat_id = int(args[0])
+    except (TypeError, ValueError):
+        await update.message.reply_text("❌ Invalid group ID.")
+        return
+    if chat_id not in WATCHED_GROUP_IDS:
+        await update.message.reply_text(f"ℹ️ Group `{chat_id}` watched list me nahi hai.", parse_mode="Markdown")
+        return
+    STOPPED_GROUP_IDS.add(chat_id)
+    try:
+        save_json("stopped_groups", sorted(STOPPED_GROUP_IDS))
+    except Exception as e:
+        STOPPED_GROUP_IDS.discard(chat_id)
+        await update.message.reply_text(f"❌ Could not save stop state: {e}")
+        return
+    await update.message.reply_text(
+        f"🛑 Group `{chat_id}` stopped.\n\n"
+        "New videos/documents auto-index nahi honge aur existing indexed results bhi users ko nahi milenge.\n"
+        "Index delete nahi hua hai. `/startgroup <group_id>` se resume kar sakte ho.",
+        parse_mode="Markdown",
+    )
+
+
+async def start_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /startgroup <group_id> — resume auto-indexing and search results."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /startgroup <group_id>")
+        return
+    try:
+        chat_id = int(args[0])
+    except (TypeError, ValueError):
+        await update.message.reply_text("❌ Invalid group ID.")
+        return
+    if chat_id not in WATCHED_GROUP_IDS:
+        await update.message.reply_text(f"ℹ️ Group `{chat_id}` watched list me nahi hai.", parse_mode="Markdown")
+        return
+    STOPPED_GROUP_IDS.discard(chat_id)
+    try:
+        save_json("stopped_groups", sorted(STOPPED_GROUP_IDS))
+    except Exception as e:
+        STOPPED_GROUP_IDS.add(chat_id)
+        await update.message.reply_text(f"❌ Could not save start state: {e}")
+        return
+    await update.message.reply_text(
+        f"▶️ Group `{chat_id}` started.\n\n"
+        "New videos/documents auto-index honge aur existing indexed results users ko milenge.",
+        parse_mode="Markdown",
+    )
+
 
 async def clear_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: /clear_group <group_id> — remove all index rows for one group."""
@@ -6743,10 +6826,19 @@ async def grptitles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 application.add_handler(CommandHandler("grpstats",      grpstats_cmd))
 application.add_handler(CommandHandler("grptitles",     grptitles_cmd))
 application.add_handler(CommandHandler("add_group",     add_group_cmd))
+application.add_handler(CommandHandler("addgroup",      add_group_cmd))
 application.add_handler(CommandHandler("all_groups",    all_groups_cmd))
+application.add_handler(CommandHandler("allgroups",     all_groups_cmd))
 application.add_handler(CommandHandler("remove_group",  remove_group_cmd))
+application.add_handler(CommandHandler("removegroup",   remove_group_cmd))
 application.add_handler(CommandHandler("clear_group",   clear_group_cmd))
+application.add_handler(CommandHandler("cleargroup",    clear_group_cmd))
 application.add_handler(CommandHandler("delete_index",  delete_index_cmd))
+application.add_handler(CommandHandler("deleteindex",   delete_index_cmd))
+application.add_handler(CommandHandler("start_group",   start_group_cmd))
+application.add_handler(CommandHandler("startgroup",    start_group_cmd))
+application.add_handler(CommandHandler("stop_group",    stop_group_cmd))
+application.add_handler(CommandHandler("stopgroup",     stop_group_cmd))
 application.add_handler(CommandHandler("clrindex",      clrindex_cmd))
 
 # ── Admin callbacks ──
