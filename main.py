@@ -6621,7 +6621,23 @@ def _start_render_port_binder():
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#080a12"><title>Movie Suggestion AI</title>
 <style>
-*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#fff;background:radial-gradient(circle at 10% 10%,#7c3aed55,transparent 32%),radial-gradient(circle at 90% 90%,#2563eb55,transparent 34%),#070910}.card{width:min(780px,100%);padding:48px 28px;text-align:center;border-radius:30px;border:1px solid #ffffff1c;background:#111522dd;backdrop-filter:blur(18px);box-shadow:0 30px 100px #0009}.logo{width:96px;height:96px;margin:0 auto 22px;display:grid;place-items:center;border-radius:28px;font-size:48px;background:linear-gradient(135deg,#7c3aed,#2563eb);box-shadow:0 16px 45px #4f46e555}h1{margin:0;font-size:clamp(34px,8vw,60px);line-height:1.05;letter-spacing:-1.8px}.grad{background:linear-gradient(90deg,#c4b5fd,#60a5fa,#a78bfa);-webkit-background-clip:text;background-clip:text;color:transparent}.tag{max-width:600px;margin:18px auto 25px;color:#b8c0d4;font-size:18px;line-height:1.65}.status{display:inline-flex;align-items:center;gap:9px;padding:9px 16px;border-radius:999px;background:#22c55e1c;border:1px solid #22c55e55;color:#86efac;font-weight:750}.dot{width:9px;height:9px;border-radius:50%;background:#22c55e;box-shadow:0 0 15px #22c55e}.features{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;margin:30px 0}.feature{padding:11px 15px;border-radius:14px;background:#ffffff09;border:1px solid #ffffff12;color:#dce2ef;font-size:14px}.btn{display:inline-block;padding:15px 25px;border-radius:15px;text-decoration:none;color:#fff;font-weight:800;background:linear-gradient(135deg,#7c3aed,#2563eb);box-shadow:0 12px 35px #4f46e555}.footer{margin-top:26px;color:#6f788d;font-size:13px}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;padding:28px 16px;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#fff;background:#05060d;overflow-x:hidden}
+body:before{content:"";position:fixed;inset:-20%;z-index:-1;background:radial-gradient(circle at 15% 15%,#7c3aed66,transparent 28%),radial-gradient(circle at 85% 30%,#2563eb55,transparent 28%),radial-gradient(circle at 50% 100%,#ec489955,transparent 30%);filter:blur(30px)}
+.card{width:min(920px,100%);margin:auto;padding:38px 22px 30px;text-align:center;border-radius:34px;border:1px solid #ffffff20;background:linear-gradient(145deg,#121524ee,#080a12e8);backdrop-filter:blur(20px);box-shadow:0 35px 110px #000b;overflow:hidden}
+.logo{width:88px;height:88px;margin:0 auto 18px;display:grid;place-items:center;border-radius:26px;font-size:45px;background:linear-gradient(135deg,#7c3aed,#2563eb);box-shadow:0 18px 55px #4f46e566;transform:perspective(600px) rotateX(8deg)}
+h1{margin:0;font-size:clamp(36px,8vw,64px);line-height:1.02;letter-spacing:-2.2px}.grad{background:linear-gradient(90deg,#ddd6fe,#60a5fa,#c4b5fd);-webkit-background-clip:text;background-clip:text;color:transparent}
+.tag{max-width:650px;margin:18px auto 22px;color:#b9c1d5;font-size:18px;line-height:1.65}
+.status{display:inline-flex;align-items:center;gap:9px;padding:9px 16px;border-radius:999px;background:#22c55e18;border:1px solid #22c55e55;color:#86efac;font-weight:750}.dot{width:9px;height:9px;border-radius:50%;background:#22c55e;box-shadow:0 0 16px #22c55e}
+.features{display:flex;flex-wrap:wrap;justify-content:center;gap:9px;margin:25px 0 20px}.feature{padding:10px 14px;border-radius:14px;background:#ffffff0a;border:1px solid #ffffff14;color:#dce2ef;font-size:14px}
+.poster-title{margin:25px 0 14px;color:#eef2ff;font-size:14px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase}
+.posters{display:flex;justify-content:center;gap:14px;flex-wrap:wrap;perspective:1000px;padding:8px 2px 24px}
+.poster{position:relative;width:105px;height:156px;border-radius:13px;overflow:hidden;border:1px solid #ffffff22;background:#111827;box-shadow:0 18px 35px #000b;transform:rotateY(-8deg) rotateX(3deg);transition:transform .35s ease,box-shadow .35s ease}
+.poster:nth-child(even){transform:rotateY(8deg) rotateX(3deg)}.poster:hover{transform:rotateY(0) rotateX(0) translateY(-10px) scale(1.06);box-shadow:0 28px 45px #000d}
+.poster img{width:100%;height:100%;display:block;object-fit:cover}.poster:after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,#fff2,transparent 30%,#0008)}
+.poster span{position:absolute;left:7px;right:7px;bottom:7px;z-index:2;font-size:10px;font-weight:800;text-shadow:0 2px 5px #000}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:15px 27px;border-radius:16px;text-decoration:none;color:#fff;font-weight:850;font-size:16px;background:linear-gradient(135deg,#7c3aed,#2563eb);box-shadow:0 14px 40px #4f46e566;transition:transform .2s ease,box-shadow .2s ease}.btn:hover{transform:translateY(-3px);box-shadow:0 20px 48px #4f46e599}
+.footer{margin-top:24px;color:#70798e;font-size:13px}
+@media(max-width:560px){.poster{width:86px;height:128px}.posters{gap:10px}.card{padding:32px 14px 26px}}
 </style></head>
 <body><main class="card">
 <div class="logo">🎬</div>
@@ -6629,7 +6645,16 @@ def _start_render_port_binder():
 <p class="tag">Discover movies, explore information and get smart recommendations through our Telegram bot.</p>
 <div class="status"><span class="dot"></span> Service Online</div>
 <div class="features"><span class="feature">🤖 AI Recommendations</span><span class="feature">🔎 Movie Search</span><span class="feature">🎞️ Movie Info</span><span class="feature">⚡ Fast &amp; Simple</span></div>
-<a class="btn" href="https://t.me/" target="_blank" rel="noopener">✈️ Open Telegram</a>
+<div class="poster-title">✨ Featured Movies</div>
+<div class="posters">
+<a class="poster" href="https://t.me/LatesttMoviebot" target="_blank" rel="noopener"><img loading="lazy" src="https://image.tmdb.org/t/p/w500/gEU2QniE6E77NI6lCU6MxlNBvIx.jpg" alt="Interstellar"><span>INTERSTELLAR</span></a>
+<a class="poster" href="https://t.me/LatesttMoviebot" target="_blank" rel="noopener"><img loading="lazy" src="https://image.tmdb.org/t/p/w500/8Gxv8gSFCU0XGDykEGv7zR1n2ua.jpg" alt="Oppenheimer"><span>OPPENHEIMER</span></a>
+<a class="poster" href="https://t.me/LatesttMoviebot" target="_blank" rel="noopener"><img loading="lazy" src="https://image.tmdb.org/t/p/w500/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg" alt="Dune"><span>DUNE</span></a>
+<a class="poster" href="https://t.me/LatesttMoviebot" target="_blank" rel="noopener"><img loading="lazy" src="https://image.tmdb.org/t/p/w500/iuFNMinLe26ziulFQ9iE2eL5r4Q.jpg" alt="Barbie"><span>BARBIE</span></a>
+<a class="poster" href="https://t.me/LatesttMoviebot" target="_blank" rel="noopener"><img loading="lazy" src="https://image.tmdb.org/t/p/w500/kyeqWdyUXW608qlYkRqosgbbJyK.jpg" alt="Avatar"><span>AVATAR</span></a>
+<a class="poster" href="https://t.me/LatesttMoviebot" target="_blank" rel="noopener"><img loading="lazy" src="https://image.tmdb.org/t/p/w500/oYuLEt3zVCKq57qu2F8dT7NIa6f.jpg" alt="Inception"><span>INCEPTION</span></a>
+</div>
+<a class="btn" href="https://t.me/LatesttMoviebot" target="_blank" rel="noopener">✈️ Open Telegram Bot</a>
 <div class="footer">Powered by Render • Movie Suggestion AI</div>
 </main></body></html>"""
                 self._send(200, "text/html; charset=utf-8", html)
