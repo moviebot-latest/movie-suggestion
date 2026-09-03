@@ -101,10 +101,45 @@ if _TURSO_ENABLED:
               "until this is fixed.")
         _TURSO_ENABLED = False
 
+_turso_local = threading.local()
+
+def _get_turso_conn():
+    """Thread-local Turso connection reuse. A single globally-shared
+    connection was tried and reverted — SQLite/libsql connections can't be
+    used from a different thread than the one that created them, and every
+    DB call in this bot runs via asyncio.to_thread on a worker thread, so
+    a shared connection raised sqlite3.ProgrammingError on first use from
+    a different thread, and — worse — left a lock permanently held since
+    nothing ever reached .close() to release it. Thread-local storage
+    avoids the cross-thread error entirely (each thread only ever touches
+    its own connection), while still saving reconnect cost across the
+    many calls that land on the same pooled worker thread."""
+    conn = getattr(_turso_local, "conn", None)
+    if conn is None:
+        conn = libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+        _turso_local.conn = conn
+    return conn
+
+class _TursoConnWrapper:
+    """Thin wrapper so callers' con.close() doesn't actually close the
+    thread-local connection. sqlite3.Connection.close (and almost
+    certainly libsql's) is a read-only slot on a C-extension type —
+    trying to monkey-patch it directly raises AttributeError on every
+    single call. Wrapping in a plain Python object sidesteps that: this
+    class's own .close is a normal, fully overridable method."""
+    def __init__(self, real_conn):
+        self._real = real_conn
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+    def close(self):
+        pass  # thread-local connection stays alive for this thread's next call
+
 def _sqlite_connect(local_file: str):
-    """DB-API connection: Turso if configured, else the local file."""
+    """DB-API connection: Turso (thread-locally reused) if configured,
+    else the local file. Existing call sites
+    (`con = _sqlite_connect(...); ...; con.close()`) work unchanged."""
     if _TURSO_ENABLED:
-        return libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+        return _TursoConnWrapper(_get_turso_conn())
     return sqlite3.connect(local_file)
 
 _json_store_lock = threading.Lock()
@@ -407,16 +442,13 @@ def progress_bar(current, total, length=10):
     return f"[{bar}] {pct}%"
 
 async def animate_search(msg):
-    steps = [(1,6,"🎬 Searching"),(2,6,"🎬 Fetching"),(3,6,"🎬 Loading"),
-             (4,6,"🎬 Almost"),(5,6,"🎬 Done"),(6,6,"✅ Found")]
-    for cur, total, label in steps:
-        bar = progress_bar(cur, total)
-        try:
-            await msg.edit_text(f"{label}...\n{bar}", parse_mode="Markdown")
-            await asyncio.sleep(0.35)
-        except: pass
+    """Single lightweight progress update; avoid 6 sequential Telegram edits."""
+    try:
+        await msg.edit_text("🎬 Searching...\n" + progress_bar(3, 6), parse_mode="Markdown")
+    except Exception:
+        pass
 
-async def animate_generic(msg, frames, delay=0.45):
+async def animate_generic(msg, frames, delay=0.25):
     for i, frame in enumerate(frames):
         bar = progress_bar(i + 1, len(frames))
         try:
@@ -508,39 +540,57 @@ _QUALITY_RANK = {"4K": 6, "2160P": 6, "1080P": 5, "720P": 4, "480P": 3, "360P": 
 def _quality_rank(quality) -> int:
     return _QUALITY_RANK.get((quality or "").upper(), 1)
 
-def _dedup_keep_best_quality(rows: list) -> list:
-    """When the same title/episode was indexed multiple times at different
-    qualities (re-uploads, multiple release groups), show only the
-    best-quality copy instead of the same content repeated 2-3x — this
-    only affects what a search surfaces, every row stays in the DB."""
-    best_by_key = {}
-    order = []
-    for r in rows:
-        key = (r["clean_title"], r.get("episode") or "")
-        if key not in best_by_key:
-            order.append(key)
-            best_by_key[key] = r
-        elif _quality_rank(r.get("quality")) > _quality_rank(best_by_key[key].get("quality")):
-            best_by_key[key] = r
-    return [best_by_key[k] for k in order]
+def _dedup_keep_one_per_variant(rows: list) -> list:
+    """Remove exact/near-exact re-index duplicates without hiding quality variants.
 
-def get_omdb(title, by_id=False, year=None):
+    The old implementation grouped only by title+episode and therefore kept
+    just the highest quality (usually 1080P), making 360/480/720/4K invisible.
+    Keep one indexed copy for each title+episode+quality+language combination.
+    """
+    seen = set()
+    out = []
+    for r in rows:
+        key = (
+            r.get("clean_title", "").lower().strip(),
+            (r.get("episode") or "").upper().strip(),
+            (r.get("quality") or "N/A").upper().strip(),
+            (r.get("language") or "N/A").lower().strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+def get_omdb(title, by_id=False, year=None, media_type=None):
     try:
         param = "i" if by_id else "t"
         url = f"https://www.omdbapi.com/?{param}={quote(title)}&apikey={OMDB_API}&plot=full"
         if year and not by_id:
             url += f"&y={quote(year)}"
-        r = requests.get(url, timeout=8)
-        return r.json()
+        # For TV/show searches, force OMDb to return a series rather than
+        # accidentally resolving a same/similar title to an old movie.
+        if media_type and not by_id:
+            url += f"&type={quote(media_type)}"
+        r = requests.get(url, timeout=5)
+        data = r.json()
+        _cache_put(cache_key, data)
+        return data
     except: return None
 
 def get_omdb_search(query, year=None):
+    cache_key = ("omdb_search", str(query).strip().lower(), str(year or ""))
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         url = f"https://www.omdbapi.com/?s={quote(query)}&apikey={OMDB_API}"
         if year:
             url += f"&y={quote(year)}"
-        r = requests.get(url, timeout=8)
-        return r.json().get("Search", [])[:5]
+        r = requests.get(url, timeout=5)
+        data = r.json().get("Search", [])[:5]
+        _cache_put(cache_key, data)
+        return data
     except: return []
 
 def get_tmdb_similar(title):
@@ -605,6 +655,33 @@ def get_actor_movies(actor_name):
     except: return []
 
 
+# ── Lightweight metadata cache (thread-safe, bounded) ─────────────────
+_META_CACHE = {}
+_META_CACHE_LOCK = threading.RLock()
+_META_CACHE_TTL = 6 * 3600
+_META_CACHE_MAX = 512
+
+def _cache_get(key):
+    now = time.monotonic()
+    with _META_CACHE_LOCK:
+        item = _META_CACHE.get(key)
+        if not item:
+            return None
+        expires, value = item
+        if expires <= now:
+            _META_CACHE.pop(key, None)
+            return None
+        return value
+
+def _cache_put(key, value):
+    if value is None:
+        return
+    with _META_CACHE_LOCK:
+        if len(_META_CACHE) >= _META_CACHE_MAX:
+            _META_CACHE.pop(next(iter(_META_CACHE)), None)
+        _META_CACHE[key] = (time.monotonic() + _META_CACHE_TTL, value)
+
+
 # ═══════════════════════════════════════════════════════════════════
 #          GROQ AI — CORE CALLER
 # ═══════════════════════════════════════════════════════════════════
@@ -617,7 +694,7 @@ async def ai_ask(prompt: str, max_tokens: int = 1000) -> Optional[str]:
         "max_tokens": max_tokens,
         "temperature": 0.75,
     }
-    timeout = aiohttp.ClientTimeout(total=20)
+    timeout = aiohttp.ClientTimeout(total=5)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(GROQ_URL, headers=headers, json=payload) as resp:
@@ -625,7 +702,7 @@ async def ai_ask(prompt: str, max_tokens: int = 1000) -> Optional[str]:
                     data = await resp.json()
                     return data["choices"][0]["message"]["content"].strip()
                 elif resp.status == 429:
-                    await asyncio.sleep(5)
+                    print("⚠️ Groq rate limited; failing fast")
                     return None
                 else:
                     text = await resp.text()
@@ -1144,7 +1221,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         try: ref_id = int(context.args[0])
         except: pass
-    register_user(user, ref_id)
+    udata = register_user(user, ref_id)
     if is_banned(user.id):
         await update.message.reply_text("🚫 You are banned.")
         return
@@ -1155,16 +1232,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-    users  = load_json("users")
-    uid    = str(user.id)
-    udata  = users.get(uid, {})
     points = udata.get("points", 0)
     refs   = udata.get("refs",   0)
     badge  = get_badge(points)
     ai_status = "✅ Groq AI" if GROQ_API else "⚠️ No AI"
-    admin_btn = []
-    if is_admin(user.id):
-        admin_btn = [[InlineKeyboardButton("👑 Admin Panel", callback_data="open_admin")]]
+    user_is_admin = is_admin(user.id)
+    admin_btn = [[InlineKeyboardButton("👑 Admin Panel", callback_data="open_admin")]] if user_is_admin else []
     keyboard = [
         [InlineKeyboardButton("🔥 Trending",    callback_data="cmd_trending"),
          InlineKeyboardButton("🎲 Random",      callback_data="cmd_random")],
@@ -1181,7 +1254,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📜 History",     callback_data="cmd_history"),
          InlineKeyboardButton("👥 Refer",       callback_data="cmd_refer")],
     ] + admin_btn
-    role = _role_badge(user.id)
+    role = "👑 " if is_owner(user.id) else ("🛡️ " if user_is_admin else "")
     await update.message.reply_text(
         f"╔═══════════════════════╗\n"
         f"║   🎬  *C I N E B O T*  v10  ║\n"
@@ -1493,7 +1566,7 @@ async def fullreview_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"╔══════════════════════════╗\n║  📝  *FULL AI REVIEW*  ║\n╚══════════════════════════╝\n\n"
             f"🎬 *{md['title']}* ({md['year']})\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"{result}\n\n_Powered by Groq AI (Llama 3.3)_ 🤖",
+            f"{result}\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)",
             parse_mode="Markdown")
     else:
         await query.message.reply_text("❌ AI review nahi likh paya. GROQ_API check karo.", parse_mode="Markdown")
@@ -1515,7 +1588,7 @@ async def moodmatch_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"╔══════════════════════════╗\n║  🎭  *MOOD MATCH*  ║\n╚══════════════════════════╝\n\n"
             f"🎬 *{md['title']}* ({md['year']})\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"{result}\n\n_Powered by Groq AI (Llama 3.3)_ 🤖",
+            f"{result}\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)",
             parse_mode="Markdown")
     else:
         await query.message.reply_text("❌ Mood match nahi hua.", parse_mode="Markdown")
@@ -1537,7 +1610,7 @@ async def castanalysis_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"╔══════════════════════════╗\n║  🌟  *CAST ANALYSIS*  ║\n╚══════════════════════════╝\n\n"
             f"🎬 *{md['title']}* ({md['year']})\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"{result}\n\n_Powered by Groq AI (Llama 3.3)_ 🤖",
+            f"{result}\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)",
             parse_mode="Markdown")
     else:
         await query.message.reply_text("❌ Cast analysis nahi hua.", parse_mode="Markdown")
@@ -1559,7 +1632,7 @@ async def trivia_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"╔══════════════════════════╗\n║  ❓  *MOVIE TRIVIA*  ║\n╚══════════════════════════╝\n\n"
             f"🎬 *{md['title']}* ({md['year']})\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"{result}\n\n_Powered by Groq AI (Llama 3.3)_ 🤖",
+            f"{result}\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)",
             parse_mode="Markdown")
     else:
         await query.message.reply_text("❌ Trivia nahi bana.", parse_mode="Markdown")
@@ -1602,7 +1675,7 @@ async def fullpackage_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(full_text) > 3800:
             await query.message.reply_text(full_text, parse_mode="Markdown")
             full_text = f"🎬 *{t}* — continued...\n"
-    full_text += "\n\n_Powered by Groq AI (Llama 3.3)_ 🤖"
+    full_text += "\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)"
     if full_text.strip():
         await query.message.reply_text(full_text, parse_mode="Markdown")
 
@@ -1635,7 +1708,7 @@ async def fullreview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"╔══════════════════════════╗\n║  📝  *FULL AI REVIEW*  ║\n╚══════════════════════════╝\n\n"
             f"🎬 *{data['Title']}* ({data['Year']})\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"{result}\n\n_Powered by Groq AI_ 🤖", parse_mode="Markdown")
+            f"{result}\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Review nahi likh paya.", parse_mode="Markdown")
 
@@ -1660,7 +1733,7 @@ async def moodmatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"╔══════════════════════╗\n║  🎭  *MOOD MATCH*  ║\n╚══════════════════════╝\n\n"
             f"🎬 *{data['Title']}* ({data['Year']})\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"{result}\n\n_Powered by Groq AI_ 🤖", parse_mode="Markdown")
+            f"{result}\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Mood match nahi hua.", parse_mode="Markdown")
 
@@ -1685,7 +1758,7 @@ async def castinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"╔══════════════════════════╗\n║  🌟  *CAST ANALYSIS*  ║\n╚══════════════════════════╝\n\n"
             f"🎬 *{data['Title']}* ({data['Year']})\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"{result}\n\n_Powered by Groq AI_ 🤖", parse_mode="Markdown")
+            f"{result}\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Cast info nahi aaya.", parse_mode="Markdown")
 
@@ -1713,7 +1786,7 @@ async def trivia_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"╔══════════════════════════╗\n║  ❓  *MOVIE TRIVIA*  ║\n╚══════════════════════════╝\n\n"
             f"🎬 *{data['Title']}* ({data['Year']})\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"{result}\n\n_Powered by Groq AI_ 🤖", parse_mode="Markdown")
+            f"{result}\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Trivia nahi bana.", parse_mode="Markdown")
 
@@ -3163,15 +3236,20 @@ async def grp_search(raw_query: str, limit: int = 5) -> List[dict]:
         # else: that season isn't indexed yet — fall through and show
         # whatever did match rather than returning nothing.
 
-    # Same title/episode indexed multiple times at different qualities —
-    # keep only the best-quality copy so results aren't cluttered with
-    # near-identical entries.
-    scored = _dedup_keep_best_quality(scored)
+    # Remove duplicate re-indexes, but KEEP every quality/language variant.
+    # Direct Video should be able to surface 360P/480P/720P/1080P/4K when
+    # those variants are actually present in the group index.
+    scored = _dedup_keep_one_per_variant(scored)
 
     # Within near-identical scores (same series, different episodes), sort
     # by episode too so results come back in watch order rather than
     # whatever order the DB happened to return them in.
-    scored.sort(key=lambda x: (-round(x["_score"], 2), x.get("episode") or ""))
+    scored.sort(key=lambda x: (
+        -round(x["_score"], 2),
+        x.get("episode") or "",
+        -_quality_rank(x.get("quality")),
+        (x.get("language") or "").lower(),
+    ))
 
     return scored[:limit]
 
@@ -3228,87 +3306,60 @@ async def grp_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /index_channel command — bulk index existing messages ──
 async def _index_channel_worker(status_msg, target_chat: int, limit: int, source_chat_id: int, bot):
     """
-    Background worker that scans a group/channel for existing video/document
-    messages and indexes them. Runs as an asyncio task so it never blocks
-    the bot's polling loop or the web service's health checks.
+    Index from the START of the chat history.
+
+    `limit` is the maximum number of message IDs to inspect.
+
+    Already-indexed message IDs are loaded once before scanning. Those messages
+    are skipped without forwarding them again, so repeated /index_channel runs
+    do not waste Telegram API calls or re-run AI extraction.
     """
     indexed = 0
+    already_indexed = 0
     skipped = 0
-    errors  = 0
-    batch   = 0
+    errors = 0
+    batch = 0
+    scanned = 0
+    check_id = 1
 
-    # Find the highest reachable message ID two ways and take the best of
-    # both: (1) walk up from 1 — this is what actually finds small/new
-    # chats (a handful of messages), which large fixed probe points always
-    # miss, and it tolerates gaps like an unforwardable "channel created"
-    # service message; (2) probe a few big numbers ascending, for
-    # established chats with far more messages than a linear walk could
-    # reach quickly. Neither call is exact — the Bot API has no direct
-    # "highest message ID" lookup — but together they cover both ends.
-    async def _probe_ok(mid: int) -> bool:
-        try:
-            fwd = await asyncio.wait_for(
-                bot.forward_message(
-                    chat_id=source_chat_id, from_chat_id=target_chat,
-                    message_id=mid, disable_notification=True,
-                ),
-                timeout=10,
-            )
-            try:
-                await fwd.delete()
-            except Exception:
-                pass
-            return True
-        except Exception:
-            return False
+    # Load the existing IDs for this chat once. This prevents already-indexed
+    # messages from being forwarded/scanned again on subsequent runs.
+    try:
+        existing_rows = await asyncio.to_thread(
+            _db_grp_fetch,
+            "SELECT message_id FROM group_files WHERE chat_id=? AND message_id<=?",
+            (target_chat, limit),
+        )
+        indexed_ids = {int(r["message_id"]) for r in existing_rows if r.get("message_id") is not None}
+    except Exception as e:
+        # If the lookup fails, do not silently skip potentially new files.
+        indexed_ids = set()
+        print(f"⚠️ Existing-index lookup failed; scanning normally: {e}")
 
-    latest_id = 0
-    for mid in range(1, 51):
-        if await _probe_ok(mid):
-            latest_id = mid
-        await asyncio.sleep(0.05)
+    while scanned < limit:
+        # Already indexed -> count it, but do NOT call Telegram forward_message.
+        if check_id in indexed_ids:
+            already_indexed += 1
+            scanned += 1
+            check_id += 1
+            batch += 1
 
-    # Checkpoints alone can undershoot: a channel with, say, 150 messages
-    # would pass the 99 checkpoint but fail 199, leaving messages 100-150
-    # completely unseen. So after finding the last checkpoint that
-    # succeeds, refine forward from it one ID at a time (tolerating gaps
-    # like deleted messages) until the true top is reached — this finds
-    # the real latest message regardless of exactly where it falls.
-    checkpoints = [99, 199, 349, 499, 749, 999, 1499, 1999, 2999,
-                   4999, 6999, 9999, 14999, 19999, 29999, 49999]
-    last_checkpoint_ok = 0
-    for cp in checkpoints:
-        if await _probe_ok(cp):
-            last_checkpoint_ok = cp
-        else:
-            break
-        await asyncio.sleep(0.05)
+            if batch >= 10:
+                batch = 0
+                try:
+                    await status_msg.edit_text(
+                        f"📦 *Indexing* `{target_chat}`\n"
+                        f"⏳ Checked: `{scanned}/{limit}` messages\n"
+                        f"✅ New indexed: `{indexed}`\n"
+                        f"♻️ Already indexed: `{already_indexed}`\n"
+                        f"⏩ Skipped: `{skipped}`\n"
+                        f"❌ Errors: `{errors}`",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+            continue
 
-    refine_from = max(latest_id, last_checkpoint_ok)
-    if refine_from > 0:
-        probe, misses, steps = refine_from, 0, 0
-        while misses < 15 and steps < 3000:
-            probe  += 1
-            steps  += 1
-            if await _probe_ok(probe):
-                latest_id = probe
-                misses = 0
-            else:
-                misses += 1
-            await asyncio.sleep(0.03)
-    latest_id = max(latest_id, last_checkpoint_ok)
-
-    if latest_id == 0:
-        # Nothing forwardable anywhere in this search — very unusual,
-        # but give the scan loop real room to work with instead of dying
-        # after a single attempt.
-        latest_id = limit + 20
-
-    scanned  = 0
-    check_id = latest_id
-    consecutive_not_found = 0
-
-    while scanned < limit and check_id > 0:
         try:
             fwd = await asyncio.wait_for(
                 bot.forward_message(
@@ -3319,7 +3370,6 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
                 ),
                 timeout=10,
             )
-            consecutive_not_found = 0
 
             if fwd.video or fwd.document:
                 caption = fwd.caption or ""
@@ -3327,21 +3377,26 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
                     caption = getattr(fwd.document, "file_name", "") or ""
 
                 if caption.strip():
-                    parsed    = _parse_caption(caption)
+                    parsed = _parse_caption(caption)
                     raw_title = parsed["clean_title"]
 
-                    ai_info      = await _ai_extract_title_info(caption, parsed)
-                    clean_title  = (ai_info["clean_title"] or raw_title).lower().strip()
-                    final_year   = ai_info["year"] or parsed["year"]
+                    ai_info = await _ai_extract_title_info(caption, parsed)
+                    clean_title = (ai_info["clean_title"] or raw_title).lower().strip()
+                    final_year = ai_info["year"] or parsed["year"]
                     content_type = ai_info["content_type"]
-                    confidence   = ai_info["confidence"]
+                    confidence = ai_info["confidence"]
 
                     if clean_title and len(clean_title) > 2:
-                        file_obj  = fwd.video or fwd.document
+                        file_obj = fwd.video or fwd.document
                         file_type = "video" if fwd.video else "document"
-                        size_mb   = round(
-                            getattr(file_obj, "file_size", 0) / (1024 * 1024), 1
-                        ) if getattr(file_obj, "file_size", 0) else 0.0
+                        size_mb = (
+                            round(
+                                getattr(file_obj, "file_size", 0) / (1024 * 1024),
+                                1,
+                            )
+                            if getattr(file_obj, "file_size", 0)
+                            else 0.0
+                        )
 
                         try:
                             await asyncio.to_thread(
@@ -3366,15 +3421,18 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
                                     confidence,
                                     parsed["season_ep"],
                                     time.time(),
-                                )
+                                ),
                             )
                             indexed += 1
-                        except Exception:
-                            skipped += 1
+                            indexed_ids.add(check_id)
+                        except Exception as e:
+                            errors += 1
+                            print(f"⚠️ Index DB error for message {check_id}: {e}")
                     else:
                         skipped += 1
                 else:
                     skipped += 1
+
             try:
                 await fwd.delete()
             except Exception:
@@ -3382,49 +3440,46 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
 
         except asyncio.TimeoutError:
             errors += 1
-            if errors > 20:
-                break
         except Exception as e:
             err_str = str(e).lower()
             if "message to forward not found" in err_str or "invalid" in err_str:
-                consecutive_not_found += 1
-                # Long stretch of missing IDs usually means we've scanned
-                # past the start of the chat's history — stop early instead
-                # of burning through the rest of the ID range one by one.
-                if consecutive_not_found > 200:
-                    break
+                skipped += 1
             else:
                 errors += 1
-                if errors > 20:
-                    break
+                print(f"⚠️ Index message {check_id} error: {e}")
 
-        check_id -= 1
-        scanned  += 1
-        batch    += 1
-        await asyncio.sleep(0.05)  # stay well clear of flood limits over a longer scan
+        scanned += 1
+        check_id += 1
+        batch += 1
 
-        if batch >= 50:
+        if batch >= 10:
             batch = 0
             try:
                 await status_msg.edit_text(
                     f"📦 *Indexing* `{target_chat}`\n"
-                    f"⏳ Progress: `{scanned}/{limit}`\n"
-                    f"✅ Indexed: `{indexed}` | ⏩ Skipped: `{skipped}`",
-                    parse_mode="Markdown"
+                    f"⏳ Checked: `{scanned}/{limit}` messages\n"
+                    f"✅ New indexed: `{indexed}`\n"
+                    f"♻️ Already indexed: `{already_indexed}`\n"
+                    f"⏩ Skipped: `{skipped}`\n"
+                    f"❌ Errors: `{errors}`",
+                    parse_mode="Markdown",
                 )
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
+
+        await asyncio.sleep(0.05)
 
     try:
         await status_msg.edit_text(
             f"✅ *Index Complete!*\n\n"
             f"📦 Chat: `{target_chat}`\n"
-            f"✅ Indexed: `{indexed}` files\n"
+            f"🔎 Checked: `{scanned}` messages\n"
+            f"✅ New indexed: `{indexed}` files\n"
+            f"♻️ Already indexed: `{already_indexed}`\n"
             f"⏩ Skipped: `{skipped}`\n"
             f"❌ Errors: `{errors}`\n\n"
-            f"_Ab users movie search karenge toh direct link milega!_",
-            parse_mode="Markdown"
+            f"_Next run mein already-indexed messages dobara scan nahi honge._",
+            parse_mode="Markdown",
         )
     except Exception:
         pass
@@ -3434,8 +3489,8 @@ async def index_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /index_channel <chat_id> [limit]
     Admin command: bulk index existing messages from a group/channel.
-    Default limit: 500 messages. Runs as a background task so it never
-    blocks the bot's polling loop or the web service's health checks.
+    Default limit: 500 messages. Scans message IDs from the beginning of the chat.
+    Runs as a background task so it never blocks the bot's polling loop.
     """
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("🔒 Admin only.", parse_mode="Markdown")
@@ -3585,7 +3640,7 @@ async def _grp_send_all_files(update_or_query_message, context, chat_id, grp_res
         ok = await _grp_send_one_file(context, chat_id, r)
         if ok:
             sent_count += 1
-            await asyncio.sleep(0.3)  # flood control
+            await asyncio.sleep(0.05)  # minimal flood control
         else:
             fail_count += 1
 
@@ -3634,7 +3689,7 @@ async def _grp_auto_send_or_confirm(context, chat_id, grp_results, raw_name, sea
             ok = await _grp_send_one_file(context, chat_id, r)
             if ok:
                 sent_count += 1
-                await asyncio.sleep(0.3)  # flood control
+                await asyncio.sleep(0.05)  # minimal flood control
             else:
                 fail_count += 1
 
@@ -3813,9 +3868,19 @@ async def _run_full_search(update, context, raw_name: str):
     # ever saw a year to guard on.
     raw_title_only, year_hint = _extract_year(raw_name)
 
-    # ── STEP 1: AI spelling fix (on the year-stripped title) ──
-    fixed_name  = await ai_fix_movie_name(raw_title_only)
-    search_name = fixed_name if fixed_name.lower() != raw_title_only.lower() else raw_title_only
+    # ── STEP 1: AI spelling fix only for inputs that plausibly need it.
+    # Plain title searches stay off the AI critical path. If AI is used, the
+    # bounded ai_ask timeout prevents a slow provider from delaying search.
+    needs_ai_fix = (
+        any(ch in raw_title_only for ch in "!?@#$%^&*=~`")
+        or len(raw_title_only.split()) >= 7
+        or bool(re.search(r"\b(?:plz|pls|plez|movvie|movi|serise|seires)\b", raw_title_only, re.I))
+    )
+    if needs_ai_fix:
+        fixed_name = await ai_fix_movie_name(raw_title_only)
+        search_name = fixed_name if fixed_name.lower() != raw_title_only.lower() else raw_title_only
+    else:
+        search_name = raw_title_only
 
     # ── STEP 2: Show poster/info card ──
     # A trailing year ("Toxic 2026") is sent as OMDB's own y= param instead
@@ -3824,13 +3889,28 @@ async def _run_full_search(update, context, raw_name: str):
     title_only, search_year = _extract_year(search_name)
     if not year_hint:
         year_hint = search_year  # AI-fixed text still had a year and raw_name didn't — rare, but keep it
-    if year_hint:
+
+    # If the user searched an episode (S15E10 / S2E3), search the SHOW as a
+    # series. Without this, OMDb can resolve a similarly named movie instead.
+    episode_match = re.search(r'\bS\d{1,2}E\d{1,3}\b', raw_name, re.IGNORECASE)
+    if episode_match:
+        tv_title = re.sub(r'\s*\bS\d{1,2}E\d{1,3}\b', '', raw_title_only, flags=re.IGNORECASE).strip()
+        poster_data = await asyncio.to_thread(
+            get_omdb, tv_title, False, year_hint, "series"
+        ) if tv_title else None
+    elif year_hint:
         poster_data = await asyncio.to_thread(get_omdb, title_only, False, year_hint)
     else:
         poster_data = await asyncio.to_thread(get_omdb, search_name)
 
     if not poster_data or poster_data.get("Response") == "False":
-        if year_hint:
+        if episode_match:
+            # Retry the show title without year in case the TV database has a
+            # slightly different premiere year.
+            poster_data = await asyncio.to_thread(get_omdb, tv_title, False, None, "series") if tv_title else None
+        if (poster_data and poster_data.get("Response") == "True"):
+            pass
+        elif year_hint:
             # Maybe OMDB's listed year is off by one from what the user typed
             # (release-date/region quirks) — retry title alone before giving up.
             poster_data = await asyncio.to_thread(get_omdb, title_only)
@@ -4108,7 +4188,7 @@ async def review_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"╔══════════════════════╗\n║  🤖  *AI REVIEW* ║\n╚══════════════════════╝\n\n"
             f"🎬 *{movie_data['Title']}* ({movie_data['Year']})\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"{review}\n\n_Powered by Groq AI (Llama 3.3)_ 🤖",
+            f"{review}\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)",
             parse_mode="Markdown")
     else:
         await query.message.reply_text("❌ Groq API ne response nahi diya.", parse_mode="Markdown")
@@ -4136,7 +4216,7 @@ async def funfact_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"╔══════════════════════╗\n║  💡  *FUN FACTS* ║\n╚══════════════════════╝\n\n"
             f"🎬 *{movie_data.get('Title')}* ({movie_data.get('Year')})\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"{facts}\n\n_Powered by Groq AI (Llama 3.3)_ 🤖",
+            f"{facts}\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)",
             parse_mode="Markdown")
     else:
         await query.message.reply_text("❌ Groq API ne response nahi diya.", parse_mode="Markdown")
@@ -4358,7 +4438,7 @@ async def compare_recv2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if result:
         await update.message.reply_text(
             f"⚖️ *MOVIE COMPARISON*\n\n🎬 *{m1}*  vs  🎬 *{m2}*\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"{result}\n\n_Powered by Groq AI (Llama 3.3)_ 🤖",
+            f"{result}\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)",
             parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Comparison nahi hua.", parse_mode="Markdown")
@@ -5288,7 +5368,7 @@ async def upcom_ai_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if review:
         await query.message.reply_text(
             f"🤖 *AI REVIEW*\n\n🎬 *{title}*\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"{review}\n\n_Powered by Groq AI_ 🤖",
+            f"{review}\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)",
             parse_mode="Markdown")
     else:
         await query.message.reply_text("❌ AI Review nahi aaya.", parse_mode="Markdown")
@@ -6483,6 +6563,13 @@ application.add_handler(MessageHandler(
 
 # ── Voice search (transcribe then run through the same search pipeline) ──
 application.add_handler(MessageHandler(filters.VOICE, voice_search_handler))
+
+# ── Lightweight handler timing for production diagnostics ───────────────
+def _log_handler_time(name, started):
+    elapsed = time.monotonic() - started
+    if elapsed >= 2.0:
+        print(f"[SLOW] {name} took {elapsed:.2f}s")
+
 
 # ── Movie search (last — catch-all) ──
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, movie))
