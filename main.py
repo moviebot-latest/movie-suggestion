@@ -6601,35 +6601,56 @@ print(f"   TMDB: {'✅' if TMDB_API else '⚠️ optional'}")
 # This runs a tiny stdlib-only HTTP server in a background thread just
 # to satisfy that check — no Flask/uvicorn dependency needed.
 def _start_render_port_binder():
+    """Public Render landing page; Telegram polling remains unchanged."""
     port = int(os.getenv("PORT", "10000"))
 
     class _Health(http.server.BaseHTTPRequestHandler):
+        def _send(self, status, content_type, body):
+            body = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"CineBot is running.")
-        def do_HEAD(self):
-            # Uptime monitors (UptimeRobot etc.) commonly use HEAD instead of
-            # GET — without this, BaseHTTPRequestHandler's default response
-            # is 501 Not Implemented, which reads as "service down" to them.
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
+            if self.path in ("/", "/health", "/healthz"):
+                html = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#080a12"><title>Movie Suggestion AI</title>
+<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#fff;background:radial-gradient(circle at 10% 10%,#7c3aed55,transparent 32%),radial-gradient(circle at 90% 90%,#2563eb55,transparent 34%),#070910}.card{width:min(780px,100%);padding:48px 28px;text-align:center;border-radius:30px;border:1px solid #ffffff1c;background:#111522dd;backdrop-filter:blur(18px);box-shadow:0 30px 100px #0009}.logo{width:96px;height:96px;margin:0 auto 22px;display:grid;place-items:center;border-radius:28px;font-size:48px;background:linear-gradient(135deg,#7c3aed,#2563eb);box-shadow:0 16px 45px #4f46e555}h1{margin:0;font-size:clamp(34px,8vw,60px);line-height:1.05;letter-spacing:-1.8px}.grad{background:linear-gradient(90deg,#c4b5fd,#60a5fa,#a78bfa);-webkit-background-clip:text;background-clip:text;color:transparent}.tag{max-width:600px;margin:18px auto 25px;color:#b8c0d4;font-size:18px;line-height:1.65}.status{display:inline-flex;align-items:center;gap:9px;padding:9px 16px;border-radius:999px;background:#22c55e1c;border:1px solid #22c55e55;color:#86efac;font-weight:750}.dot{width:9px;height:9px;border-radius:50%;background:#22c55e;box-shadow:0 0 15px #22c55e}.features{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;margin:30px 0}.feature{padding:11px 15px;border-radius:14px;background:#ffffff09;border:1px solid #ffffff12;color:#dce2ef;font-size:14px}.btn{display:inline-block;padding:15px 25px;border-radius:15px;text-decoration:none;color:#fff;font-weight:800;background:linear-gradient(135deg,#7c3aed,#2563eb);box-shadow:0 12px 35px #4f46e555}.footer{margin-top:26px;color:#6f788d;font-size:13px}
+</style></head>
+<body><main class="card">
+<div class="logo">🎬</div>
+<h1><span class="grad">Movie Suggestion</span> AI</h1>
+<p class="tag">Discover movies, explore information and get smart recommendations through our Telegram bot.</p>
+<div class="status"><span class="dot"></span> Service Online</div>
+<div class="features"><span class="feature">🤖 AI Recommendations</span><span class="feature">🔎 Movie Search</span><span class="feature">🎞️ Movie Info</span><span class="feature">⚡ Fast &amp; Simple</span></div>
+<a class="btn" href="https://t.me/" target="_blank" rel="noopener">✈️ Open Telegram</a>
+<div class="footer">Powered by Render • Movie Suggestion AI</div>
+</main></body></html>"""
+                self._send(200, "text/html; charset=utf-8", html)
+            else:
+                self._send(404, "text/plain; charset=utf-8", "Not found")
+
         def log_message(self, *args):
-            pass  # keep Render's log stream focused on the bot, not HTTP noise
+            return
 
     def _serve():
         try:
-            server = http.server.HTTPServer(("0.0.0.0", port), _Health)
-            print(f"🌐 Render port binder listening on 0.0.0.0:{port}")
+            server = http.server.ThreadingHTTPServer(("0.0.0.0", port), _Health)
+            print(f"🌐 Public website listening on 0.0.0.0:{port}")
             server.serve_forever()
         except Exception as e:
-            print(f"⚠️ Render port binder failed to start: {e}")
+            print(f"⚠️ Public website failed to start: {e}")
 
     threading.Thread(target=_serve, daemon=True).start()
 
 _start_render_port_binder()
+
 
 application.run_polling(
     allowed_updates=["message", "callback_query", "inline_query"],
