@@ -563,6 +563,17 @@ def _dedup_keep_one_per_variant(rows: list) -> list:
     return out
 
 def get_omdb(title, by_id=False, year=None, media_type=None):
+    cache_key = (
+        "omdb",
+        str(title).strip().lower(),
+        bool(by_id),
+        str(year or ""),
+        str(media_type or "")
+    )
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         param = "i" if by_id else "t"
         url = f"https://www.omdbapi.com/?{param}={quote(title)}&apikey={OMDB_API}&plot=full"
@@ -576,7 +587,9 @@ def get_omdb(title, by_id=False, year=None, media_type=None):
         data = r.json()
         _cache_put(cache_key, data)
         return data
-    except: return None
+    except Exception as e:
+        print(f"[OMDB] {e}")
+        return None
 
 def get_omdb_search(query, year=None):
     cache_key = ("omdb_search", str(query).strip().lower(), str(year or ""))
