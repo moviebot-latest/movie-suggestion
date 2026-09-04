@@ -1620,25 +1620,11 @@ async def castanalysis_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await loader.delete()
     except: pass
     if result:
-        text = (
-            f"╔══════════════════════════╗\n"
-            f"║  🌟  CAST ANALYSIS  ║\n"
-            f"╚══════════════════════════╝\n\n"
-            f"🎬 {md['title']} ({md['year']})\n"
-            f"━━━━━━━━━━━━━━━━━━\n\n"
-            f"{result}\n\n"
-            f"Powered by @LatesttMoviebot"
-        )
-        try:
-            await query.message.reply_text(text, parse_mode=None)
-        except Exception as e:
-            print(f"⚠️ Cast analysis send failed: {e}")
-            try:
-                await query.message.reply_text(
-                    f"🌟 CAST ANALYSIS\n\n{result}\n\nPowered by @LatesttMoviebot"
-                )
-            except Exception as e2:
-                print(f"⚠️ Cast analysis fallback failed: {e2}")
+        await query.message.reply_text(
+            f"╔══════════════════════════╗\n║  🌟  *CAST ANALYSIS*  ║\n╚══════════════════════════╝\n\n"
+            f"🎬 *{md['title']}* ({md['year']})\n━━━━━━━━━━━━━━━━━━\n\n"
+            f"{result}\n\n[Powered by @LatesttMoviebot](https://t.me/LatesttMoviebot)",
+            parse_mode="Markdown")
     else:
         await query.message.reply_text("❌ Cast analysis nahi hua.", parse_mode="Markdown")
 
@@ -2838,34 +2824,6 @@ for _gid in _RAW_GROUP_IDS.split(","):
         except ValueError:
             pass
 
-# Groups added by the Owner with /add_group are persisted in the bot's JSON store.
-# Environment GROUP_IDS remains supported as the initial/static source.
-try:
-    _saved_watched_groups = load_json("watched_groups", [])
-    if isinstance(_saved_watched_groups, list):
-        for _gid in _saved_watched_groups:
-            try:
-                _gid = int(_gid)
-                if _gid not in WATCHED_GROUP_IDS:
-                    WATCHED_GROUP_IDS.append(_gid)
-            except (TypeError, ValueError):
-                pass
-except Exception:
-    pass
-
-# Temporarily stopped groups: keep DB index, hide results, pause auto-indexing.
-STOPPED_GROUP_IDS = set()
-try:
-    _saved_stopped_groups = load_json("stopped_groups", [])
-    if isinstance(_saved_stopped_groups, list):
-        for _gid in _saved_stopped_groups:
-            try:
-                STOPPED_GROUP_IDS.add(int(_gid))
-            except (TypeError, ValueError):
-                pass
-except Exception:
-    pass
-
 GRP_INDEX_DB = "group_index.db"
 _grp_db_lock = threading.Lock()
 
@@ -3247,11 +3205,6 @@ async def grp_search(raw_query: str, limit: int = 5) -> List[dict]:
     if not all_rows:
         return []
 
-    if STOPPED_GROUP_IDS:
-        all_rows = [r for r in all_rows if int(r["chat_id"]) not in STOPPED_GROUP_IDS]
-    if not all_rows:
-        return []
-
     # Deduplicate by (chat_id, message_id)
     seen   = set()
     unique = []
@@ -3357,8 +3310,6 @@ async def grp_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = msg.chat.id
     if WATCHED_GROUP_IDS and chat_id not in WATCHED_GROUP_IDS:
-        return
-    if chat_id in STOPPED_GROUP_IDS:
         return
     if not (msg.video or msg.document):
         return
@@ -3623,274 +3574,6 @@ async def grpstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"💬 Chat `{r['chat_id']}`\n   Files: `{r['cnt']}` | Last: _{last_ts}_\n\n"
     text += f"_Watched Groups: {WATCHED_GROUP_IDS or 'All (GROUP_IDS not set)'}_"
     await update.message.reply_text(text, parse_mode="Markdown")
-
-
-# ── Group management commands ──
-async def add_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner-only: /add_group <group_id>
-    Adds a group to the live watched list and persists it across restarts.
-    """
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("👑 Owner only.")
-        return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /add_group <group_id>\nExample: /add_group -1001234567890")
-        return
-
-    try:
-        chat_id = int(args[0])
-    except (TypeError, ValueError):
-        await update.message.reply_text("❌ Invalid group ID. Example: /add_group -1001234567890")
-        return
-
-    if chat_id in WATCHED_GROUP_IDS:
-        await update.message.reply_text(f"ℹ️ Group `{chat_id}` already added.", parse_mode="Markdown")
-        return
-
-    WATCHED_GROUP_IDS.append(chat_id)
-    try:
-        saved = load_json("watched_groups", [])
-        if not isinstance(saved, list):
-            saved = []
-        if chat_id not in [int(x) for x in saved if str(x).lstrip("-").isdigit()]:
-            saved.append(chat_id)
-        save_json("watched_groups", saved)
-        await update.message.reply_text(
-            f"✅ Group `{chat_id}` added.\n\n"
-            "New video/document messages will now be indexed automatically.\n"
-            "For old messages, use `/index_channel <group_id> <limit>`. ",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        # Keep runtime state consistent if persistence fails.
-        try:
-            WATCHED_GROUP_IDS.remove(chat_id)
-        except ValueError:
-            pass
-        await update.message.reply_text(f"❌ Could not save group: {e}")
-
-
-
-async def all_groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner/Admin: /all_groups — show all currently watched groups."""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.")
-        return
-
-    groups = list(dict.fromkeys(WATCHED_GROUP_IDS))
-    if not groups:
-        await update.message.reply_text(
-            "📭 Koi watched group nahi hai.\n"
-            "Owner `/add_group <group_id>` se group add kar sakta hai."
-        )
-        return
-
-    lines = ["📋 *Watched Groups*", ""]
-    for i, chat_id in enumerate(groups, 1):
-        lines.append(f"{i}. `{chat_id}`")
-    lines.append("")
-    lines.append(f"Total: `{len(groups)}`")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def remove_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner-only: /remove_group <group_id> — stop watching a group."""
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("👑 Owner only.")
-        return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /remove_group <group_id>")
-        return
-
-    try:
-        chat_id = int(args[0])
-    except (TypeError, ValueError):
-        await update.message.reply_text("❌ Invalid group ID.")
-        return
-
-    if chat_id not in WATCHED_GROUP_IDS:
-        await update.message.reply_text(f"ℹ️ Group `{chat_id}` watched list me nahi hai.", parse_mode="Markdown")
-        return
-
-    # Remove from the live list.
-    WATCHED_GROUP_IDS[:] = [gid for gid in WATCHED_GROUP_IDS if gid != chat_id]
-
-    # Persist the dynamic /add_group list.
-    try:
-        saved = load_json("watched_groups", [])
-        if not isinstance(saved, list):
-            saved = []
-        saved_ids = []
-        for item in saved:
-            try:
-                gid = int(item)
-                if gid != chat_id and gid not in saved_ids:
-                    saved_ids.append(gid)
-            except (TypeError, ValueError):
-                pass
-        save_json("watched_groups", saved_ids)
-
-        # GROUP_IDS is environment/static config, so removing a group from
-        # the runtime list does not edit Render environment variables.
-        await update.message.reply_text(
-            f"✅ Group `{chat_id}` removed from watched list.\n"
-            "Is group ke naye messages ab auto-index nahi honge.",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        # Restore runtime state if persistence fails.
-        if chat_id not in WATCHED_GROUP_IDS:
-            WATCHED_GROUP_IDS.append(chat_id)
-        await update.message.reply_text(f"❌ Could not save group removal: {e}")
-
-async def stop_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /stopgroup <group_id> — pause auto-indexing and hide search results."""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.")
-        return
-    args = context.args or []
-    if not args:
-        await update.message.reply_text("Usage: /stopgroup <group_id>")
-        return
-    try:
-        chat_id = int(args[0])
-    except (TypeError, ValueError):
-        await update.message.reply_text("❌ Invalid group ID.")
-        return
-    if chat_id not in WATCHED_GROUP_IDS:
-        await update.message.reply_text(f"ℹ️ Group `{chat_id}` watched list me nahi hai.", parse_mode="Markdown")
-        return
-    STOPPED_GROUP_IDS.add(chat_id)
-    try:
-        save_json("stopped_groups", sorted(STOPPED_GROUP_IDS))
-    except Exception as e:
-        STOPPED_GROUP_IDS.discard(chat_id)
-        await update.message.reply_text(f"❌ Could not save stop state: {e}")
-        return
-    await update.message.reply_text(
-        f"🛑 Group `{chat_id}` stopped.\n\n"
-        "New videos/documents auto-index nahi honge aur existing indexed results bhi users ko nahi milenge.\n"
-        "Index delete nahi hua hai. `/startgroup <group_id>` se resume kar sakte ho.",
-        parse_mode="Markdown",
-    )
-
-
-async def start_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /startgroup <group_id> — resume auto-indexing and search results."""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.")
-        return
-    args = context.args or []
-    if not args:
-        await update.message.reply_text("Usage: /startgroup <group_id>")
-        return
-    try:
-        chat_id = int(args[0])
-    except (TypeError, ValueError):
-        await update.message.reply_text("❌ Invalid group ID.")
-        return
-    if chat_id not in WATCHED_GROUP_IDS:
-        await update.message.reply_text(f"ℹ️ Group `{chat_id}` watched list me nahi hai.", parse_mode="Markdown")
-        return
-    STOPPED_GROUP_IDS.discard(chat_id)
-    try:
-        save_json("stopped_groups", sorted(STOPPED_GROUP_IDS))
-    except Exception as e:
-        STOPPED_GROUP_IDS.add(chat_id)
-        await update.message.reply_text(f"❌ Could not save start state: {e}")
-        return
-    await update.message.reply_text(
-        f"▶️ Group `{chat_id}` started.\n\n"
-        "New videos/documents auto-index honge aur existing indexed results users ko milenge.",
-        parse_mode="Markdown",
-    )
-
-
-async def clear_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /clear_group <group_id> — remove all index rows for one group."""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.")
-        return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /clear_group <group_id>")
-        return
-
-    try:
-        chat_id = int(args[0])
-    except (TypeError, ValueError):
-        await update.message.reply_text("❌ Invalid group ID.")
-        return
-
-    try:
-        before = await asyncio.to_thread(
-            _db_grp_fetch,
-            "SELECT COUNT(*) AS cnt FROM group_files WHERE chat_id=?",
-            (chat_id,),
-        )
-        count = int(before[0]["cnt"]) if before else 0
-        await asyncio.to_thread(
-            _db_grp_execute,
-            "DELETE FROM group_files WHERE chat_id=?",
-            (chat_id,),
-        )
-        await update.message.reply_text(
-            f"🗑 Group `{chat_id}` ka index clear ho gaya.\n"
-            f"Removed entries: `{count}`",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-
-
-async def delete_index_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /delete_index <group_id> <message_id> — remove one index row only."""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.")
-        return
-
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Usage: /delete_index <group_id> <message_id>")
-        return
-
-    try:
-        chat_id = int(args[0])
-        message_id = int(args[1])
-    except (TypeError, ValueError):
-        await update.message.reply_text("❌ Group ID and message ID must be numbers.")
-        return
-
-    try:
-        rows = await asyncio.to_thread(
-            _db_grp_fetch,
-            "SELECT id FROM group_files WHERE chat_id=? AND message_id=?",
-            (chat_id, message_id),
-        )
-        if not rows:
-            await update.message.reply_text(
-                f"ℹ️ Index entry nahi mila for `{chat_id}` / `{message_id}`.",
-                parse_mode="Markdown",
-            )
-            return
-
-        await asyncio.to_thread(
-            _db_grp_execute,
-            "DELETE FROM group_files WHERE chat_id=? AND message_id=?",
-            (chat_id, message_id),
-        )
-        await update.message.reply_text(
-            f"✅ Index entry deleted: `{chat_id}` / `{message_id}`\n"
-            "Telegram ka original message is command se delete nahi hota.",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
 
 
 # ── /clrindex — clear index ──
@@ -4400,8 +4083,14 @@ async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = query.from_user.id
     await query.answer()
 
+    # The first poster keyboard briefly uses gv_pending before the real
+    # keyboard is installed. If the user taps during that tiny window, use
+    # the poster message id itself; its movie data is stored under the same
+    # id immediately after sending the poster.
     msg_id = query.data.replace("gv_", "")
-    stored = context.user_data.get(msg_id) if msg_id != "pending" else None
+    if msg_id == "pending":
+        msg_id = str(query.message.message_id)
+    stored = context.user_data.get(msg_id)
 
     if not stored or not stored.get("title"):
         await query.message.reply_text(
@@ -4423,6 +4112,33 @@ async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     await animate_search(loader)
 
     grp_results = await grp_search(search_name, limit=20)
+
+    # Fast local fallback: Direct Video must still work when the AI spelling
+    # helper/semantic reranker fails or changes the query. Search the actual
+    # indexed SQLite rows directly using title words + fuzzy scoring.
+    if not grp_results:
+        try:
+            title_only, query_year = _extract_year(search_name.lower().strip())
+            words = [w for w in re.findall(r"\w+", title_only) if len(w) > 2]
+            if words:
+                where = " OR ".join(["clean_title LIKE ?"] * len(words))
+                rows = await asyncio.to_thread(
+                    _db_grp_fetch,
+                    f"SELECT * FROM group_files WHERE {where} LIMIT 100",
+                    tuple(f"%{w}%" for w in words),
+                )
+                fallback = []
+                for r in rows:
+                    score = _grp_title_similarity(title_only, r.get("clean_title", ""),
+                                                   query_year=query_year, row_year=r.get("year"))
+                    if score >= 0.25:
+                        r["_score"] = score
+                        fallback.append(r)
+                fallback.sort(key=lambda r: r["_score"], reverse=True)
+                grp_results = _dedup_keep_one_per_variant(fallback[:20])
+        except Exception as e:
+            print(f"⚠️ Direct Video local fallback error: {e}")
+
     try: await loader.delete()
     except: pass
 
@@ -6566,16 +6282,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💬 *Chat Mode:* Bina command ke bhi poocho — \"sad hoon kuch dikhao\", "
         "\"RRR vs KGF compare\" jaisa kuch bhi likho\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "👑 *Group Management*\n"
-        "➕ /add_group <group_id> — Add group (Owner)\n"
-        "📋 /all_groups — List watched groups (Admin)\n"
-        "➖ /remove_group <group_id> — Remove group (Owner)\n"
-        "▶️ /start_group <group_id> — Start group (Admin)\n"
-        "🛑 /stop_group <group_id> — Stop group (Admin)\n"
-        "🗑 /clear_group <group_id> — Clear group index (Admin)\n"
-        "❌ /delete_index <group_id> <message_id> — Delete one index (Admin)\n"
-        "📥 /index_channel <group_id> <limit> — Index old messages (Admin)\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
         "🤖 *AI Features*\n"
         "🎬 /movieinfo    — TMDB rich movie info\n"
         "📝 /fullreview   — Detailed AI review\n"
@@ -6825,20 +6531,6 @@ async def grptitles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 application.add_handler(CommandHandler("grpstats",      grpstats_cmd))
 application.add_handler(CommandHandler("grptitles",     grptitles_cmd))
-application.add_handler(CommandHandler("add_group",     add_group_cmd))
-application.add_handler(CommandHandler("addgroup",      add_group_cmd))
-application.add_handler(CommandHandler("all_groups",    all_groups_cmd))
-application.add_handler(CommandHandler("allgroups",     all_groups_cmd))
-application.add_handler(CommandHandler("remove_group",  remove_group_cmd))
-application.add_handler(CommandHandler("removegroup",   remove_group_cmd))
-application.add_handler(CommandHandler("clear_group",   clear_group_cmd))
-application.add_handler(CommandHandler("cleargroup",    clear_group_cmd))
-application.add_handler(CommandHandler("delete_index",  delete_index_cmd))
-application.add_handler(CommandHandler("deleteindex",   delete_index_cmd))
-application.add_handler(CommandHandler("start_group",   start_group_cmd))
-application.add_handler(CommandHandler("startgroup",    start_group_cmd))
-application.add_handler(CommandHandler("stop_group",    stop_group_cmd))
-application.add_handler(CommandHandler("stopgroup",     stop_group_cmd))
 application.add_handler(CommandHandler("clrindex",      clrindex_cmd))
 
 # ── Admin callbacks ──
@@ -6942,93 +6634,35 @@ print(f"   TMDB: {'✅' if TMDB_API else '⚠️ optional'}")
 # This runs a tiny stdlib-only HTTP server in a background thread just
 # to satisfy that check — no Flask/uvicorn dependency needed.
 def _start_render_port_binder():
-    """Public Render landing page; Telegram polling remains unchanged."""
     port = int(os.getenv("PORT", "10000"))
 
     class _Health(http.server.BaseHTTPRequestHandler):
-        def _send(self, status, content_type, body):
-            body = body.encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_HEAD(self):
-            # UptimeRobot HTTP monitors may use HEAD requests.
-            # BaseHTTPRequestHandler returns 501 for HEAD unless implemented.
-            if self.path in ("/", "/health", "/healthz"):
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-            else:
-                self.send_response(404)
-                self.end_headers()
-
         def do_GET(self):
-            if self.path in ("/", "/health", "/healthz"):
-                html = """<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#080a12"><title>Movie Suggestion AI</title>
-<style>
-*{box-sizing:border-box}body{margin:0;min-height:100vh;padding:28px 16px;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#fff;background:#05060d;overflow-x:hidden}
-body:before{content:"";position:fixed;inset:-20%;z-index:-1;background:radial-gradient(circle at 15% 15%,#7c3aed66,transparent 28%),radial-gradient(circle at 85% 30%,#2563eb55,transparent 28%),radial-gradient(circle at 50% 100%,#ec489955,transparent 30%);filter:blur(30px)}
-.card{width:min(920px,100%);margin:auto;padding:38px 22px 30px;text-align:center;border-radius:34px;border:1px solid #ffffff20;background:linear-gradient(145deg,#121524ee,#080a12e8);backdrop-filter:blur(20px);box-shadow:0 35px 110px #000b;overflow:hidden}
-.logo{width:88px;height:88px;margin:0 auto 18px;display:grid;place-items:center;border-radius:26px;font-size:45px;background:linear-gradient(135deg,#7c3aed,#2563eb);box-shadow:0 18px 55px #4f46e566;transform:perspective(600px) rotateX(8deg)}
-h1{margin:0;font-size:clamp(36px,8vw,64px);line-height:1.02;letter-spacing:-2.2px}.grad{background:linear-gradient(90deg,#ddd6fe,#60a5fa,#c4b5fd);-webkit-background-clip:text;background-clip:text;color:transparent}
-.tag{max-width:650px;margin:18px auto 22px;color:#b9c1d5;font-size:18px;line-height:1.65}
-.status{display:inline-flex;align-items:center;gap:9px;padding:9px 16px;border-radius:999px;background:#22c55e18;border:1px solid #22c55e55;color:#86efac;font-weight:750}.dot{width:9px;height:9px;border-radius:50%;background:#22c55e;box-shadow:0 0 16px #22c55e}
-.features{display:flex;flex-wrap:wrap;justify-content:center;gap:9px;margin:25px 0 20px}.feature{padding:10px 14px;border-radius:14px;background:#ffffff0a;border:1px solid #ffffff14;color:#dce2ef;font-size:14px}
-.poster-title{margin:25px 0 14px;color:#eef2ff;font-size:14px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase}
-.posters{display:flex;justify-content:center;gap:14px;flex-wrap:wrap;perspective:1000px;padding:8px 2px 24px}
-.poster{position:relative;width:105px;height:156px;border-radius:13px;overflow:hidden;border:1px solid #ffffff22;background:#111827;box-shadow:0 18px 35px #000b;transform:rotateY(-8deg) rotateX(3deg);transition:transform .35s ease,box-shadow .35s ease}
-.poster:nth-child(even){transform:rotateY(8deg) rotateX(3deg)}.poster:hover{transform:rotateY(0) rotateX(0) translateY(-10px) scale(1.06);box-shadow:0 28px 45px #000d}
-.poster img{width:100%;height:100%;display:block;object-fit:cover}.poster:after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,#fff2,transparent 30%,#0008)}
-.poster span{position:absolute;left:7px;right:7px;bottom:7px;z-index:2;font-size:10px;font-weight:800;text-shadow:0 2px 5px #000}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:15px 27px;border-radius:16px;text-decoration:none;color:#fff;font-weight:850;font-size:16px;background:linear-gradient(135deg,#7c3aed,#2563eb);box-shadow:0 14px 40px #4f46e566;transition:transform .2s ease,box-shadow .2s ease}.btn:hover{transform:translateY(-3px);box-shadow:0 20px 48px #4f46e599}
-.footer{margin-top:24px;color:#70798e;font-size:13px}
-@media(max-width:560px){.poster{width:86px;height:128px}.posters{gap:10px}.card{padding:32px 14px 26px}}
-</style></head>
-<body><main class="card">
-<div class="logo">🎬</div>
-<h1><span class="grad">Movie Suggestion</span> AI</h1>
-<p class="tag">Discover movies, explore information and get smart recommendations through our Telegram bot.</p>
-<div class="status"><span class="dot"></span> Service Online</div>
-<div class="features"><span class="feature">🤖 AI Recommendations</span><span class="feature">🔎 Movie Search</span><span class="feature">🎞️ Movie Info</span><span class="feature">⚡ Fast &amp; Simple</span></div>
-<div class="poster-title">✨ Featured Movies</div>
-<div class="posters">
-<a class="poster" href="https://t.me/LatesttMoviebot" target="_blank" rel="noopener"><img loading="lazy" src="https://image.tmdb.org/t/p/w500/gEU2QniE6E77NI6lCU6MxlNBvIx.jpg" alt="Interstellar"><span>INTERSTELLAR</span></a>
-<a class="poster" href="https://t.me/LatesttMoviebot" target="_blank" rel="noopener"><img loading="lazy" src="https://image.tmdb.org/t/p/w500/8Gxv8gSFCU0XGDykEGv7zR1n2ua.jpg" alt="Oppenheimer"><span>OPPENHEIMER</span></a>
-<a class="poster" href="https://t.me/LatesttMoviebot" target="_blank" rel="noopener"><img loading="lazy" src="https://image.tmdb.org/t/p/w500/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg" alt="Dune"><span>DUNE</span></a>
-<a class="poster" href="https://t.me/LatesttMoviebot" target="_blank" rel="noopener"><img loading="lazy" src="https://image.tmdb.org/t/p/w500/iuFNMinLe26ziulFQ9iE2eL5r4Q.jpg" alt="Barbie"><span>BARBIE</span></a>
-<a class="poster" href="https://t.me/LatesttMoviebot" target="_blank" rel="noopener"><img loading="lazy" src="https://image.tmdb.org/t/p/w500/kyeqWdyUXW608qlYkRqosgbbJyK.jpg" alt="Avatar"><span>AVATAR</span></a>
-<a class="poster" href="https://t.me/LatesttMoviebot" target="_blank" rel="noopener"><img loading="lazy" src="https://image.tmdb.org/t/p/w500/oYuLEt3zVCKq57qu2F8dT7NIa6f.jpg" alt="Inception"><span>INCEPTION</span></a>
-</div>
-<a class="btn" href="https://t.me/LatesttMoviebot" target="_blank" rel="noopener">✈️ Open Telegram Bot</a>
-<div class="footer">Powered by Render • Movie Suggestion AI</div>
-</main></body></html>"""
-                self._send(200, "text/html; charset=utf-8", html)
-            else:
-                self._send(404, "text/plain; charset=utf-8", "Not found")
-
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"CineBot is running.")
+        def do_HEAD(self):
+            # Uptime monitors (UptimeRobot etc.) commonly use HEAD instead of
+            # GET — without this, BaseHTTPRequestHandler's default response
+            # is 501 Not Implemented, which reads as "service down" to them.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
         def log_message(self, *args):
-            return
+            pass  # keep Render's log stream focused on the bot, not HTTP noise
 
     def _serve():
         try:
-            server = http.server.ThreadingHTTPServer(("0.0.0.0", port), _Health)
-            print(f"🌐 Public website listening on 0.0.0.0:{port}")
+            server = http.server.HTTPServer(("0.0.0.0", port), _Health)
+            print(f"🌐 Render port binder listening on 0.0.0.0:{port}")
             server.serve_forever()
         except Exception as e:
-            print(f"⚠️ Public website failed to start: {e}")
+            print(f"⚠️ Render port binder failed to start: {e}")
 
     threading.Thread(target=_serve, daemon=True).start()
 
 _start_render_port_binder()
-
 
 application.run_polling(
     allowed_updates=["message", "callback_query", "inline_query"],
