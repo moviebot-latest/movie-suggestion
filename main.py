@@ -1477,6 +1477,9 @@ async def _send_movie_card(update, context, data, reply_to=None, is_search=False
 
     msg_obj = reply_to if reply_to else update.message
 
+    # Temporary keyboard is shown only until the final keyboard is installed.
+    # Every temporary callback is handled by pending_button_cb, which resolves
+    # the current poster message_id before calling the real callback.
     temp_keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎬 Direct Video ⚡", callback_data="gv_pending")],
         [InlineKeyboardButton("🎬 Trailer",   url=trailer),
@@ -4211,6 +4214,60 @@ async def pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("❌ Load nahi hua. Try again.", parse_mode="Markdown")
 
 
+# Resolve buttons tapped during the tiny window before the real movie
+# keyboard is installed. This makes ALL *_tmp buttons functional.
+async def pending_button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    # Do NOT answer here: the real callback handler below answers the same
+    # Telegram callback. Answering twice can create a second API request/error.
+    action = query.data[:-4]  # remove "_tmp"
+    msg_id = str(query.message.message_id)
+    movie_data = context.user_data.get(msg_id)
+
+    if not movie_data:
+        await query.message.reply_text(
+            "⚠️ Movie session expired. Movie naam dobara bhejo.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Build the same payload used by the final keyboard.
+    if action == "s":
+        query.data = f"srv_{msg_id}"
+        await servers_cb(update, context)
+    elif action == "sim":
+        query.data = f"sim_{msg_id}"
+        await similar_cb(update, context)
+    elif action == "rev":
+        query.data = f"rev_{movie_data.get('imdb_id', '')}"
+        await review_cb(update, context)
+    elif action == "fun":
+        query.data = f"fun_{movie_data.get('imdb_id', '')}"
+        await funfact_cb(update, context)
+    elif action == "rate":
+        query.data = f"rate_{msg_id}"
+        await rate_cb(update, context)
+    elif action == "frev":
+        query.data = f"frev_{msg_id}"
+        await fullreview_cb(update, context)
+    elif action == "mood_match":
+        query.data = f"mood_match_{msg_id}"
+        await moodmatch_cb(update, context)
+    elif action == "cast":
+        query.data = f"cast_{msg_id}"
+        await castanalysis_cb(update, context)
+    elif action == "trivia":
+        query.data = f"trivia_{msg_id}"
+        await trivia_cb(update, context)
+    elif action == "pkg":
+        query.data = f"pkg_{msg_id}"
+        await fullpackage_cb(update, context)
+    else:
+        try:
+            await query.answer("⚠️ Button session expired.", show_alert=True)
+        except Exception:
+            pass
+
 # ═══════════════════════════════════════════════════════════════════
 #   AI REVIEW / FUN FACTS / RATE / SIMILAR / SERVERS / BACK CALLBACKS
 # ═══════════════════════════════════════════════════════════════════
@@ -5698,7 +5755,9 @@ async def adm_addadmin_recv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loader = await update.message.reply_text("⚙️ Processing...\n" + progress_bar(1, 3), parse_mode="Markdown")
     if len(parts) >= 2:
         try:
-            hours  = int(parts[1])
+            hours = int(parts[1])
+            if hours <= 0:
+                raise ValueError("hours must be positive")
             expiry = now_ist().timestamp() + (hours * 3600)
             admins[str(target_id)] = {"id": target_id, "type": "temporary", "hours": hours,
                                       "expiry": expiry, "added_by": update.effective_user.id,
@@ -5884,12 +5943,19 @@ async def adm_servers_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📡 *Server Manager*\n━━━━━━━━━━━━━━━━━━\n\n"
     for i in range(1, 7):
         text += f"*{i}.* _{servers[f's{i}']['name']}_\n`{servers[f's{i}']['url']}`\n\n"
-    keyboard = [
-        [InlineKeyboardButton(f"✏️ S{i} — {servers[f's{i}']['name']}", callback_data=f"adm_edit_s{i}")]
-        for i in range(1, 7)
-    ]
+    keyboard = []
+    for i in range(1, 7):
+        info = servers.get(f"s{i}", DEFAULT_SERVERS[f"s{i}"])
+        raw_url = str(info.get("url", "")).strip()
+        # Telegram URL buttons require an absolute http/https URL.
+        if not raw_url.startswith(("http://", "https://")):
+            raw_url = DEFAULT_SERVERS[f"s{i}"]["url"]
+        keyboard.append([
+            InlineKeyboardButton(f"🌐 Open S{i}", url=raw_url),
+            InlineKeyboardButton(f"✏️ Edit S{i}", callback_data=f"adm_edit_s{i}"),
+        ])
     keyboard.append([InlineKeyboardButton("🔄 Reset Default", callback_data="adm_reset")])
-    keyboard.append([InlineKeyboardButton("⬅️ Back",          callback_data="adm_back")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="adm_back")])
     sent = await query.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
     asyncio.create_task(auto_delete(sent, 60))
 
@@ -5908,11 +5974,18 @@ async def adm_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def adm_recv_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return ConversationHandler.END
     url = update.message.text.strip()
-    if not url.startswith("http"):
-        await update.message.reply_text("❌ Invalid URL. Try again or /cancel")
+    if not url.startswith(("http://", "https://")):
+        await update.message.reply_text(
+            "❌ Invalid URL. http:// ya https:// se start hona chahiye.\n/cancel"
+        )
         return W_URL
     context.user_data["new_url"] = url
-    sk = context.user_data["editing_server"]
+    sk = context.user_data.get("editing_server")
+    if sk not in DEFAULT_SERVERS:
+        context.user_data.pop("editing_server", None)
+        context.user_data.pop("new_url", None)
+        await update.message.reply_text("⚠️ Server edit session expire ho gaya. /admin se dobara try karo.")
+        return ConversationHandler.END
     await update.message.reply_text(
         f"✅ URL saved!\n\n📝 Display name bhejo (current: `{load_servers()[sk]['name']}`):\n/cancel",
         parse_mode="Markdown")
@@ -5921,9 +5994,17 @@ async def adm_recv_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def adm_recv_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return ConversationHandler.END
     global bot_servers
-    name    = update.message.text.strip()
-    url     = context.user_data["new_url"]
-    sk      = context.user_data["editing_server"]
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("❌ Display name empty nahi ho sakta. Dobara bhejo ya /cancel.")
+        return W_NAME
+    url = context.user_data.get("new_url", "").strip()
+    sk  = context.user_data.get("editing_server")
+    if sk not in DEFAULT_SERVERS or not url.startswith(("http://", "https://")):
+        context.user_data.pop("editing_server", None)
+        context.user_data.pop("new_url", None)
+        await update.message.reply_text("⚠️ Server edit session invalid/expired. /admin se dobara try karo.")
+        return ConversationHandler.END
     loader  = await update.message.reply_text("💾 Saving...\n" + progress_bar(0, 3), parse_mode="Markdown")
     await animate_generic(loader, FRAMES["save"])
     servers = load_json("servers", {k: v.copy() for k, v in DEFAULT_SERVERS.items()})
@@ -5974,9 +6055,10 @@ async def adm_maint_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not is_admin(query.from_user.id): return ConversationHandler.END
     maint = load_json("maintenance", {"active": False, "message": ""})
+    current = str(maint.get("message", "")).strip() or "(empty)"
     await query.message.reply_text(
-        f"✏️ Current message:\n_{maint.get('message', '')}_\n\n📝 Naya message:\n/cancel",
-        parse_mode="Markdown")
+        f"✏️ Current message:\n{current}\n\n📝 Naya message bhejo:\n/cancel"
+    )
     return W_MAINT_MSG
 
 async def adm_recv_maint_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6410,6 +6492,7 @@ application = (
 )
 
 master_conv = ConversationHandler(
+    allow_reentry=True,
     entry_points=[
         CallbackQueryHandler(adm_edit,             pattern="^adm_edit_s"),
         CallbackQueryHandler(adm_maint_msg,        pattern="^adm_maint_msg$"),
@@ -6572,6 +6655,15 @@ application.add_handler(CallbackQueryHandler(upcom_add_cb,      pattern="^upcom_
 
 # ── User callbacks ──
 application.add_handler(master_conv)
+
+# Temporary movie-card callbacks. These MUST be before the broad ^sim_/^rev_
+# handlers so the *_tmp race is resolved with the current poster message ID.
+application.add_handler(
+    CallbackQueryHandler(
+        pending_button_cb,
+        pattern=r"^(s|sim|rev|fun|rate|frev|mood_match|cast|trivia|pkg)_tmp$",
+    )
+)
 application.add_handler(CallbackQueryHandler(start_btn_cb,   pattern="^cmd_(?!suggest|plotsearch|mood|compare)"))
 application.add_handler(CallbackQueryHandler(start_btn_cb,   pattern="^open_admin$"))
 application.add_handler(CallbackQueryHandler(wl_save_cb,     pattern="^wl_save\\|"))
@@ -6600,6 +6692,17 @@ application.add_handler(CallbackQueryHandler(grp_confirm_no_cb,  pattern="^grp_c
 
 # ── Direct Video button on poster card ──
 application.add_handler(CallbackQueryHandler(grp_direct_video_cb, pattern="^gv_"))
+
+# ── Unknown callback safety net — MUST stay LAST among callback handlers ──
+async def unknown_callback_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer("⚠️ This button is currently unavailable.", show_alert=True)
+    except Exception:
+        pass
+    print(f"⚠️ Unhandled callback_data: {query.data!r}")
+
+application.add_handler(CallbackQueryHandler(unknown_callback_cb))
 
 # ── Group file auto-indexer (video/document in watched groups) ──
 application.add_handler(MessageHandler(
@@ -6634,7 +6737,10 @@ print(f"   TMDB: {'✅' if TMDB_API else '⚠️ optional'}")
 # This runs a tiny stdlib-only HTTP server in a background thread just
 # to satisfy that check — no Flask/uvicorn dependency needed.
 def _start_render_port_binder():
-    port = int(os.getenv("PORT", "10000"))
+    try:
+        port = int(os.getenv("PORT", "10000"))
+    except (TypeError, ValueError):
+        port = 10000
 
     class _Health(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
