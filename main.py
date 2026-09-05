@@ -3169,8 +3169,16 @@ async def grp_search(raw_query: str, limit: int = 5) -> List[dict]:
     5. Season filter applied, then sorted by score then episode order
     Returns top matches sorted by score.
     """
-    # AI fix spelling
-    fixed = await ai_fix_movie_name(raw_query)
+    # Keep normal title searches off the AI critical path. Groq is used only
+    # for obvious typos/free-form input, so a normal group search can hit
+    # SQLite immediately instead of waiting on an external API.
+    raw_clean = raw_query.strip()
+    needs_ai_fix = (
+        len(raw_clean.split()) >= 7
+        or any(ch in raw_clean for ch in "!?@#$%^&*=~`")
+        or bool(re.search(r"\b(?:plz|pls|plez|movvie|movi|serise|seires)\b", raw_clean, re.I))
+    )
+    fixed = await ai_fix_movie_name(raw_clean) if needs_ai_fix else raw_clean
     query_clean = fixed.lower().strip()
     title_only, query_year = _extract_year(query_clean)
     if not query_year:
@@ -3257,14 +3265,11 @@ async def grp_search(raw_query: str, limit: int = 5) -> List[dict]:
     # Within near-identical scores (same series, different episodes), sort
     # by episode too so results come back in watch order rather than
     # whatever order the DB happened to return them in.
-    scored.sort(key=lambda x: (
-        -round(x["_score"], 2),
-        x.get("episode") or "",
-        -_quality_rank(x.get("quality")),
-        (x.get("language") or "").lower(),
-    ))
-
-    return scored[:limit]
+    # Search relevance decides which rows qualify; once selected, delivery is
+    # always serial/episode-wise (E01, E02, E03 ...), with quality variants
+    # grouped under the same episode.
+    scored.sort(key=lambda x: (-round(x["_score"], 2), _grp_serial_sort_key(x)))
+    return _grp_order_results(scored[:limit])
 
 
 async def _grp_closest_miss(query_title: str) -> Optional[dict]:
@@ -3286,6 +3291,25 @@ async def _grp_closest_miss(query_title: str) -> Optional[dict]:
             best_score, best = s, r
     return {"title": best["clean_title"], "score": best_score} if best else None
 
+
+# ── Stable serial/episode ordering ──────────────────────────────────
+def _grp_serial_sort_key(r: dict):
+    """
+    Keep returned files in watch order:
+      S01E01, S01E02, ... S01E10, then later seasons.
+    For movies without an episode tag, fall back to message_id.
+    Quality variants for the same episode stay together, best quality first.
+    """
+    ep = str(r.get("episode") or "").upper()
+    m = re.match(r"S(\d{1,2})E(\d{1,3})", ep)
+    if m:
+        season = int(m.group(1))
+        episode = int(m.group(2))
+        return (0, season, episode, -_quality_rank(r.get("quality")), int(r.get("message_id") or 0))
+    return (1, 0, 0, -_quality_rank(r.get("quality")), int(r.get("message_id") or 0))
+
+def _grp_order_results(rows: list) -> list:
+    return sorted(rows, key=_grp_serial_sort_key)
 
 # ── Build Telegram direct link ──
 def _grp_direct_link(chat_id: int, message_id: int) -> str:
@@ -3309,7 +3333,9 @@ async def grp_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
     chat_id = msg.chat.id
-    if WATCHED_GROUP_IDS and chat_id not in WATCHED_GROUP_IDS:
+    # Respect dynamic group management (/addgroup, /stopgroup, /startgroup)
+    # as well as legacy GROUP_IDS configuration.
+    if not _group_is_watched(chat_id):
         return
     if not (msg.video or msg.document):
         return
@@ -3541,7 +3567,7 @@ async def index_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(
         f"📦 *Indexing chat* `{target_chat}`\n"
         f"Limit: `{limit}` messages\n\n"
-        f"_Background mein chal raha hai, bot normal kaam karta rahega..._",
+        f"_Background mein chalega; existing auto-indexing bhi active rahega._",
         parse_mode="Markdown"
     )
 
@@ -3601,27 +3627,29 @@ async def clrindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════
 #       MOVIE SEARCH (OMDB)
 # ═══════════════════════════════════════════════════════════════════
-def _grp_file_caption(r: dict) -> str:
+def _grp_file_caption(r: dict, serial_no: int = None, total: int = None) -> str:
     quality  = r.get("quality",  "N/A")
     language = r.get("language", "N/A")
     year     = r.get("year",     "")
     episode  = r.get("episode",  "")
     size_mb  = r.get("size_mb",  0.0)
     size_str = f"{size_mb:.0f} MB" if size_mb else "N/A"
+    serial = f"📌 `{serial_no}/{total}` " if serial_no and total else ""
     return (
-        f"🎬 *{r['clean_title'].title()}*"
+        serial
+        + f"🎬 *{r['clean_title'].title()}*"
         + (f" `({year})`" if year else "")
         + (f" `[{episode}]`" if episode else "") + "\n"
         f"📺 `{quality}` | 🌐 `{language}` | 💾 `{size_str}`"
     )
 
 
-async def _grp_send_one_file(context, chat_id, r: dict) -> bool:
+async def _grp_send_one_file(context, chat_id, r: dict, serial_no: int = None, total: int = None) -> bool:
     """Send a single indexed file (video or document) to chat_id. Returns True on success."""
     file_id = r.get("file_id", "")
     if not file_id:
         return False
-    caption = _grp_file_caption(r)
+    caption = _grp_file_caption(r, serial_no=serial_no, total=total)
     try:
         if r.get("file_type") == "video":
             await context.bot.send_video(
@@ -3649,8 +3677,10 @@ async def _grp_send_all_files(update_or_query_message, context, chat_id, grp_res
     confirm-flow preview), so the final count reflects the true total."""
     sent_count = 0
     fail_count = 0
-    for r in grp_results:
-        ok = await _grp_send_one_file(context, chat_id, r)
+    grp_results = _grp_order_results(grp_results)
+    total_to_send = len(grp_results)
+    for idx, r in enumerate(grp_results, 1):
+        ok = await _grp_send_one_file(context, chat_id, r, serial_no=idx, total=total_to_send)
         if ok:
             sent_count += 1
             await asyncio.sleep(0.05)  # minimal flood control
@@ -3698,8 +3728,10 @@ async def _grp_auto_send_or_confirm(context, chat_id, grp_results, raw_name, sea
             parse_mode="Markdown",
         )
         sent_count = fail_count = 0
-        for r in grp_results:
-            ok = await _grp_send_one_file(context, chat_id, r)
+        grp_results = _grp_order_results(grp_results)
+        total_to_send = len(grp_results)
+        for idx, r in enumerate(grp_results, 1):
+            ok = await _grp_send_one_file(context, chat_id, r, serial_no=idx, total=total_to_send)
             if ok:
                 sent_count += 1
                 await asyncio.sleep(0.05)  # minimal flood control
@@ -3750,10 +3782,11 @@ async def _grp_offer_confirmation(context, chat_id, grp_results, raw_name, searc
         parse_mode="Markdown",
     )
 
+    grp_results = _grp_order_results(grp_results)
     sample    = grp_results[:3]
     remaining = grp_results[3:]
-    for r in sample:
-        await _grp_send_one_file(context, chat_id, r)
+    for idx, r in enumerate(sample, 1):
+        await _grp_send_one_file(context, chat_id, r, serial_no=idx, total=len(grp_results))
         await asyncio.sleep(0.3)
 
     # Only the files NOT already sent as samples go to the confirm-yes
@@ -4151,13 +4184,20 @@ async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await _direct_progress_update(loader, "🎯 Exact file/message match verified", 75)
 
-    try: await loader.delete()
-    except: pass
-
     if grp_results:
+        # Keep the progress message alive until 100%; deleting it first made
+        # the final 100% update silently fail.
         await _direct_progress_update(loader, "📤 Telegram file fetch/send", 100)
+        try:
+            await loader.delete()
+        except Exception:
+            pass
         await _grp_auto_send_or_confirm(context, chat_id, grp_results, search_name, title, user_id)
     else:
+        try:
+            await loader.delete()
+        except Exception:
+            pass
         closest = await _grp_closest_miss(title)
         hint = (f"\n🔍 _Sabse close jo mila: '{closest['title']}' (`{int(closest['score']*100)}%` match)_\n"
                 if closest and closest["score"] > 0.1 else "")
@@ -6355,6 +6395,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/cleargroup <group_id>` — us group ka index clear\n"
         "`/deleteindex <group_id> <message_id>` — sirf ek video/index delete\n"
         "`/indexchannel <group_id> <limit>` — indexing\n"
+        "`/index_channel <group_id> <limit>` — same command (legacy alias)\n"
         "`/scanfile <group_id> <message_id>` — sirf single file scan\n"
         "`/grptitles` — group titles list\n"
         "`/grpstats` — group/index stats\n"
