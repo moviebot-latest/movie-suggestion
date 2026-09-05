@@ -79,281 +79,6 @@ if GROQ_API:
 #                      PERSISTENT STORAGE
 # ═══════════════════════════════════════════════════════════════════
 
-
-# ===== GROUP MANAGEMENT ADDED; EXISTING CODE PRESERVED =====
-async def addgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/addgroup CHAT_ID [limit] — add a group to the dynamic watch list.
-    If limit is supplied, immediately start a background index of that many
-    messages. Only admins can use it.
-    """
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.")
-        return
-    args = context.args or []
-    if not args:
-        await update.message.reply_text(
-            "❌ Usage: `/addgroup CHAT_ID [limit]`\n"
-            "Example: `/addgroup -1001234567890 500`",
-            parse_mode="Markdown",
-        )
-        return
-    try:
-        chat_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid group ID.")
-        return
-    try:
-        chat = await context.bot.get_chat(chat_id)
-        title = getattr(chat, "title", "") or getattr(chat, "username", "") or ""
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ Bot group access check failed:\n`{e}`\n\n"
-            "Bot ko target group mein add/admin karo.",
-            parse_mode="Markdown",
-        )
-        return
-
-    _group_add(chat_id, title)
-    msg = f"✅ Group added: `{chat_id}`\n📝 {title or 'Untitled'}\n"
-    if len(args) >= 2:
-        try:
-            limit = max(1, min(int(args[1]), 5000))
-        except ValueError:
-            await update.message.reply_text(msg + "⚠️ Invalid limit; group add ho gaya, indexing start nahi hui.", parse_mode="Markdown")
-            return
-        status = await update.message.reply_text(
-            msg + f"\n📦 Indexing `{limit}` messages in background...",
-            parse_mode="Markdown",
-        )
-        asyncio.create_task(
-            _index_channel_worker(status, chat_id, limit, update.effective_chat.id, context.bot)
-        )
-    else:
-        await update.message.reply_text(
-            msg + "\n📡 Auto-indexing ON.\n"
-            "Existing files ke liye: `/index_channel {chat_id} 500`",
-            parse_mode="Markdown",
-        )
-
-async def allgroups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.")
-        return
-    state = _load_group_state()
-    dynamic = state.get("groups", {})
-    stopped = {str(x) for x in state.get("stopped", [])}
-    lines = ["👥 *GROUP LIST*", "━━━━━━━━━━━━━━━━━━"]
-    if not dynamic and not WATCHED_GROUP_IDS:
-        lines.append("⚠️ Dynamic list empty — legacy mode: all groups are watched.")
-    else:
-        if WATCHED_GROUP_IDS:
-            lines.append("⚙️ Env GROUP_IDS: " + ", ".join(map(str, WATCHED_GROUP_IDS)))
-        if dynamic:
-            for gid, info in dynamic.items():
-                status = "⏸ STOPPED" if str(gid) in stopped else "🟢 ACTIVE"
-                title = info.get("title", "") if isinstance(info, dict) else ""
-                lines.append(f"{status} `{gid}` {title}".rstrip())
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def removegroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.")
-        return
-    args = context.args or []
-    if not args:
-        await update.message.reply_text("❌ Usage: `/removegroup CHAT_ID`", parse_mode="Markdown")
-        return
-    try:
-        chat_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid group ID.")
-        return
-    _group_remove(chat_id)
-    await update.message.reply_text(
-        f"✅ `{chat_id}` dynamic watch list se remove ho gaya.\n"
-        "⚠️ Existing index delete nahi hua. `/cleargroup` use karo agar index bhi clear karna hai.",
-        parse_mode="Markdown",
-    )
-
-async def startgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.")
-        return
-    args = context.args or []
-    if not args:
-        await update.message.reply_text("❌ Usage: `/startgroup CHAT_ID`", parse_mode="Markdown")
-        return
-    try:
-        chat_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid group ID.")
-        return
-    _group_start(chat_id)
-    await update.message.reply_text(f"▶️ Group `{chat_id}` started. Auto-indexing active.", parse_mode="Markdown")
-
-async def stopgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.")
-        return
-    args = context.args or []
-    if not args:
-        await update.message.reply_text("❌ Usage: `/stopgroup CHAT_ID`", parse_mode="Markdown")
-        return
-    try:
-        chat_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid group ID.")
-        return
-    _group_stop(chat_id)
-    await update.message.reply_text(
-        f"⏸ Group `{chat_id}` stopped.\n"
-        "New files is group se auto-index nahi honge. Existing index delete nahi hua.",
-        parse_mode="Markdown",
-    )
-
-async def cleargroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.")
-        return
-    args = context.args or []
-    if not args:
-        await update.message.reply_text("❌ Usage: `/cleargroup CHAT_ID`", parse_mode="Markdown")
-        return
-    try:
-        chat_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid group ID.")
-        return
-    await asyncio.to_thread(_db_grp_execute, "DELETE FROM group_files WHERE chat_id=?", (chat_id,))
-    await update.message.reply_text(f"🗑 Group `{chat_id}` ka poora index clear ho gaya.", parse_mode="Markdown")
-
-async def deleteindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.")
-        return
-    args = context.args or []
-    if len(args) < 2:
-        await update.message.reply_text(
-            "❌ Usage: `/deleteindex CHAT_ID MESSAGE_ID`\n"
-            "Sirf wahi single index delete hoga.",
-            parse_mode="Markdown",
-        )
-        return
-    try:
-        chat_id, message_id = int(args[0]), int(args[1])
-    except ValueError:
-        await update.message.reply_text("❌ CHAT_ID aur MESSAGE_ID numbers hone chahiye.")
-        return
-    rows = await asyncio.to_thread(
-        _db_grp_fetch,
-        "SELECT id FROM group_files WHERE chat_id=? AND message_id=? LIMIT 1",
-        (chat_id, message_id),
-    )
-    if not rows:
-        await update.message.reply_text("ℹ️ Is message ka index nahi mila.", parse_mode="Markdown")
-        return
-    await asyncio.to_thread(
-        _db_grp_execute,
-        "DELETE FROM group_files WHERE chat_id=? AND message_id=?",
-        (chat_id, message_id),
-    )
-    await update.message.reply_text(
-        f"✅ Single index deleted.\nChat: `{chat_id}`\nMessage: `{message_id}`",
-        parse_mode="Markdown",
-    )
-
-async def scanfile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Scan/index exactly one source message; never scans the whole group."""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("🔒 Admin only.")
-        return
-    args = context.args or []
-    if len(args) < 2:
-        await update.message.reply_text(
-            "❌ Usage: `/scanfile CHAT_ID MESSAGE_ID`",
-            parse_mode="Markdown",
-        )
-        return
-    try:
-        chat_id, message_id = int(args[0]), int(args[1])
-    except ValueError:
-        await update.message.reply_text("❌ CHAT_ID aur MESSAGE_ID numbers hone chahiye.")
-        return
-
-    existing = await asyncio.to_thread(
-        _db_grp_fetch,
-        "SELECT id FROM group_files WHERE chat_id=? AND message_id=? LIMIT 1",
-        (chat_id, message_id),
-    )
-    if existing:
-        await update.message.reply_text("♻️ Ye file already indexed hai. Duplicate entry nahi banegi.")
-        return
-
-    status = await update.message.reply_text(
-        f"🔎 Single file scan:\nChat `{chat_id}`\nMessage `{message_id}`",
-        parse_mode="Markdown",
-    )
-    try:
-        fwd = await asyncio.wait_for(
-            context.bot.forward_message(
-                chat_id=update.effective_chat.id,
-                from_chat_id=chat_id,
-                message_id=message_id,
-                disable_notification=True,
-            ),
-            timeout=15,
-        )
-        ok = False
-        file_obj = fwd.video or fwd.document
-        if file_obj:
-            caption = (fwd.caption or "").strip()
-            if not caption:
-                caption = getattr(file_obj, "file_name", "") or ""
-            if caption.strip():
-                parsed = _parse_caption(caption)
-                ai_info = await _ai_extract_title_info(caption, parsed)
-                clean_title = (ai_info.get("clean_title") or parsed["clean_title"]).lower().strip()
-                final_year = ai_info.get("year") or parsed["year"]
-                content_type = ai_info.get("content_type", "series" if parsed.get("season_ep") else "movie")
-                confidence = ai_info.get("confidence", 0.4)
-                if len(clean_title) >= 2:
-                    file_type = "video" if fwd.video else "document"
-                    size_mb = round(getattr(file_obj, "file_size", 0) / (1024 * 1024), 1) if getattr(file_obj, "file_size", 0) else 0.0
-                    await asyncio.to_thread(
-                        _db_grp_execute,
-                        """INSERT OR IGNORE INTO group_files
-                           (chat_id, message_id, file_id, file_name, clean_title,
-                            quality, language, year, size_mb, file_type,
-                            content_type, ai_confidence, episode, indexed_at)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            chat_id, message_id, file_obj.file_id, caption[:200],
-                            clean_title, parsed["quality"], parsed["language"],
-                            final_year, size_mb, file_type, content_type,
-                            confidence, parsed["season_ep"], time.time(),
-                        ),
-                    )
-                    ok = True
-        try:
-            await fwd.delete()
-        except Exception:
-            pass
-        if ok:
-            await status.edit_text(
-                f"✅ *Single file indexed!*\n\nChat: `{chat_id}`\nMessage: `{message_id}`",
-                parse_mode="Markdown",
-            )
-        else:
-            await status.edit_text(
-                "⚠️ Message mein supported video/document ya usable filename/caption nahi mila.",
-                parse_mode="Markdown",
-            )
-    except Exception as e:
-        try:
-            await status.edit_text(f"❌ Scan error: `{str(e)[:800]}`", parse_mode="Markdown")
-        except Exception:
-            pass
-
 # ── Turso (persistent SQLite) — optional, falls back to local files ──
 # Render's free tier has ephemeral disk: local .json/.db files get wiped
 # on every restart/redeploy. If TURSO_DATABASE_URL + TURSO_AUTH_TOKEN are
@@ -4352,6 +4077,15 @@ async def grp_confirm_no_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _direct_progress_update(message, label, pct):
+    try:
+        filled=max(0,min(10,int(pct/10)))
+        bar='█'*filled+'·'*(10-filled)
+        await message.edit_text(f"{label}\n`{pct}%` [{bar}]", parse_mode="Markdown")
+    except Exception:
+        pass
+
+
 # ── Callback: user tapped "🎬 Direct Video ⚡" on the poster card ──
 async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
@@ -4384,9 +4118,10 @@ async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
         text="⏳ *Finding...*\n" + progress_bar(0, 6),
         parse_mode="Markdown",
     )
-    await animate_search(loader)
+    await _direct_progress_update(loader, "🔎 Video/file search start", 25)
 
     grp_results = await grp_search(search_name, limit=20)
+    await _direct_progress_update(loader, "📂 Group index/database matching", 50)
 
     # Fast local fallback: Direct Video must still work when the AI spelling
     # helper/semantic reranker fails or changes the query. Search the actual
@@ -4414,10 +4149,13 @@ async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             print(f"⚠️ Direct Video local fallback error: {e}")
 
+    await _direct_progress_update(loader, "🎯 Exact file/message match verified", 75)
+
     try: await loader.delete()
     except: pass
 
     if grp_results:
+        await _direct_progress_update(loader, "📤 Telegram file fetch/send", 100)
         await _grp_auto_send_or_confirm(context, chat_id, grp_results, search_name, title, user_id)
     else:
         closest = await _grp_closest_miss(title)
@@ -6614,6 +6352,27 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown")
 
 
+    # Group Management commands — appended without removing existing help text.
+    group_help = (
+        "\n\n👥 *Group Management*\n"
+        "`/addgroup <group_id>` — new group add + index\n"
+        "`/allgroups` — added groups ki list\n"
+        "`/removegroup <group_id>` — group remove\n"
+        "`/startgroup <group_id>` — group active\n"
+        "`/stopgroup <group_id>` — group temporarily stop\n"
+        "`/cleargroup <group_id>` — us group ka index clear\n"
+        "`/deleteindex <group_id> <message_id>` — sirf ek video/index delete\n"
+        "`/indexchannel <group_id> <limit>` — indexing\n"
+        "`/scanfile <group_id> <message_id>` — sirf single file scan\n"
+        "`/grptitles` — group titles list\n"
+        "`/grpstats` — group/index stats\n"
+    )
+    try:
+        await update.message.reply_text(group_help, parse_mode="Markdown")
+    except Exception:
+        pass
+
+
 
 # ═══════════════════════════════════════════════════════════════════
 #   DAILY REMINDER LOOP
@@ -6671,6 +6430,281 @@ async def post_init(application):
 # ═══════════════════════════════════════════════════════════════════
 #   APPLICATION BUILD
 # ═══════════════════════════════════════════════════════════════════
+
+
+# --- Restored group-management handlers (preserved from working build) ---
+async def addgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addgroup CHAT_ID [limit] — add a group to the dynamic watch list.
+    If limit is supplied, immediately start a background index of that many
+    messages. Only admins can use it.
+    """
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "❌ Usage: `/addgroup CHAT_ID [limit]`\n"
+            "Example: `/addgroup -1001234567890 500`",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid group ID.")
+        return
+    try:
+        chat = await context.bot.get_chat(chat_id)
+        title = getattr(chat, "title", "") or getattr(chat, "username", "") or ""
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Bot group access check failed:\n`{e}`\n\n"
+            "Bot ko target group mein add/admin karo.",
+            parse_mode="Markdown",
+        )
+        return
+
+    _group_add(chat_id, title)
+    msg = f"✅ Group added: `{chat_id}`\n📝 {title or 'Untitled'}\n"
+    if len(args) >= 2:
+        try:
+            limit = max(1, min(int(args[1]), 5000))
+        except ValueError:
+            await update.message.reply_text(msg + "⚠️ Invalid limit; group add ho gaya, indexing start nahi hui.", parse_mode="Markdown")
+            return
+        status = await update.message.reply_text(
+            msg + f"\n📦 Indexing `{limit}` messages in background...",
+            parse_mode="Markdown",
+        )
+        asyncio.create_task(
+            _index_channel_worker(status, chat_id, limit, update.effective_chat.id, context.bot)
+        )
+    else:
+        await update.message.reply_text(
+            msg + "\n📡 Auto-indexing ON.\n"
+            "Existing files ke liye: `/index_channel {chat_id} 500`",
+            parse_mode="Markdown",
+        )
+
+async def allgroups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    state = _load_group_state()
+    dynamic = state.get("groups", {})
+    stopped = {str(x) for x in state.get("stopped", [])}
+    lines = ["👥 *GROUP LIST*", "━━━━━━━━━━━━━━━━━━"]
+    if not dynamic and not WATCHED_GROUP_IDS:
+        lines.append("⚠️ Dynamic list empty — legacy mode: all groups are watched.")
+    else:
+        if WATCHED_GROUP_IDS:
+            lines.append("⚙️ Env GROUP_IDS: " + ", ".join(map(str, WATCHED_GROUP_IDS)))
+        if dynamic:
+            for gid, info in dynamic.items():
+                status = "⏸ STOPPED" if str(gid) in stopped else "🟢 ACTIVE"
+                title = info.get("title", "") if isinstance(info, dict) else ""
+                lines.append(f"{status} `{gid}` {title}".rstrip())
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def removegroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("❌ Usage: `/removegroup CHAT_ID`", parse_mode="Markdown")
+        return
+    try:
+        chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid group ID.")
+        return
+    _group_remove(chat_id)
+    await update.message.reply_text(
+        f"✅ `{chat_id}` dynamic watch list se remove ho gaya.\n"
+        "⚠️ Existing index delete nahi hua. `/cleargroup` use karo agar index bhi clear karna hai.",
+        parse_mode="Markdown",
+    )
+
+async def startgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("❌ Usage: `/startgroup CHAT_ID`", parse_mode="Markdown")
+        return
+    try:
+        chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid group ID.")
+        return
+    _group_start(chat_id)
+    await update.message.reply_text(f"▶️ Group `{chat_id}` started. Auto-indexing active.", parse_mode="Markdown")
+
+async def stopgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("❌ Usage: `/stopgroup CHAT_ID`", parse_mode="Markdown")
+        return
+    try:
+        chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid group ID.")
+        return
+    _group_stop(chat_id)
+    await update.message.reply_text(
+        f"⏸ Group `{chat_id}` stopped.\n"
+        "New files is group se auto-index nahi honge. Existing index delete nahi hua.",
+        parse_mode="Markdown",
+    )
+
+async def cleargroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("❌ Usage: `/cleargroup CHAT_ID`", parse_mode="Markdown")
+        return
+    try:
+        chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid group ID.")
+        return
+    await asyncio.to_thread(_db_grp_execute, "DELETE FROM group_files WHERE chat_id=?", (chat_id,))
+    await update.message.reply_text(f"🗑 Group `{chat_id}` ka poora index clear ho gaya.", parse_mode="Markdown")
+
+async def deleteindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "❌ Usage: `/deleteindex CHAT_ID MESSAGE_ID`\n"
+            "Sirf wahi single index delete hoga.",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        chat_id, message_id = int(args[0]), int(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ CHAT_ID aur MESSAGE_ID numbers hone chahiye.")
+        return
+    rows = await asyncio.to_thread(
+        _db_grp_fetch,
+        "SELECT id FROM group_files WHERE chat_id=? AND message_id=? LIMIT 1",
+        (chat_id, message_id),
+    )
+    if not rows:
+        await update.message.reply_text("ℹ️ Is message ka index nahi mila.", parse_mode="Markdown")
+        return
+    await asyncio.to_thread(
+        _db_grp_execute,
+        "DELETE FROM group_files WHERE chat_id=? AND message_id=?",
+        (chat_id, message_id),
+    )
+    await update.message.reply_text(
+        f"✅ Single index deleted.\nChat: `{chat_id}`\nMessage: `{message_id}`",
+        parse_mode="Markdown",
+    )
+
+async def scanfile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Scan/index exactly one source message; never scans the whole group."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "❌ Usage: `/scanfile CHAT_ID MESSAGE_ID`",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        chat_id, message_id = int(args[0]), int(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ CHAT_ID aur MESSAGE_ID numbers hone chahiye.")
+        return
+
+    existing = await asyncio.to_thread(
+        _db_grp_fetch,
+        "SELECT id FROM group_files WHERE chat_id=? AND message_id=? LIMIT 1",
+        (chat_id, message_id),
+    )
+    if existing:
+        await update.message.reply_text("♻️ Ye file already indexed hai. Duplicate entry nahi banegi.")
+        return
+
+    status = await update.message.reply_text(
+        f"🔎 Single file scan:\nChat `{chat_id}`\nMessage `{message_id}`",
+        parse_mode="Markdown",
+    )
+    try:
+        fwd = await asyncio.wait_for(
+            context.bot.forward_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=chat_id,
+                message_id=message_id,
+                disable_notification=True,
+            ),
+            timeout=15,
+        )
+        ok = False
+        file_obj = fwd.video or fwd.document
+        if file_obj:
+            caption = (fwd.caption or "").strip()
+            if not caption:
+                caption = getattr(file_obj, "file_name", "") or ""
+            if caption.strip():
+                parsed = _parse_caption(caption)
+                ai_info = await _ai_extract_title_info(caption, parsed)
+                clean_title = (ai_info.get("clean_title") or parsed["clean_title"]).lower().strip()
+                final_year = ai_info.get("year") or parsed["year"]
+                content_type = ai_info.get("content_type", "series" if parsed.get("season_ep") else "movie")
+                confidence = ai_info.get("confidence", 0.4)
+                if len(clean_title) >= 2:
+                    file_type = "video" if fwd.video else "document"
+                    size_mb = round(getattr(file_obj, "file_size", 0) / (1024 * 1024), 1) if getattr(file_obj, "file_size", 0) else 0.0
+                    await asyncio.to_thread(
+                        _db_grp_execute,
+                        """INSERT OR IGNORE INTO group_files
+                           (chat_id, message_id, file_id, file_name, clean_title,
+                            quality, language, year, size_mb, file_type,
+                            content_type, ai_confidence, episode, indexed_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            chat_id, message_id, file_obj.file_id, caption[:200],
+                            clean_title, parsed["quality"], parsed["language"],
+                            final_year, size_mb, file_type, content_type,
+                            confidence, parsed["season_ep"], time.time(),
+                        ),
+                    )
+                    ok = True
+        try:
+            await fwd.delete()
+        except Exception:
+            pass
+        if ok:
+            await status.edit_text(
+                f"✅ *Single file indexed!*\n\nChat: `{chat_id}`\nMessage: `{message_id}`",
+                parse_mode="Markdown",
+            )
+        else:
+            await status.edit_text(
+                "⚠️ Message mein supported video/document ya usable filename/caption nahi mila.",
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        try:
+            await status.edit_text(f"❌ Scan error: `{str(e)[:800]}`", parse_mode="Markdown")
+        except Exception:
+            pass
 application = (
     ApplicationBuilder()
     .token(TOKEN)
@@ -6680,6 +6714,7 @@ application = (
     .pool_timeout(30)
     .get_updates_connect_timeout(30)
     .get_updates_read_timeout(30)
+    .concurrent_updates(True)
     .post_init(post_init)
     .build()
 )
@@ -6939,7 +6974,7 @@ def _start_render_port_binder():
 _start_render_port_binder()
 
 
-# ===== GROUP MANAGEMENT REGISTRATIONS ADDED =====
+# --- Restored missing command registrations ---
 application.add_handler(CommandHandler("addgroup", addgroup_cmd))
 application.add_handler(CommandHandler("allgroups", allgroups_cmd))
 application.add_handler(CommandHandler("removegroup", removegroup_cmd))
@@ -6947,8 +6982,8 @@ application.add_handler(CommandHandler("startgroup", startgroup_cmd))
 application.add_handler(CommandHandler("stopgroup", stopgroup_cmd))
 application.add_handler(CommandHandler("cleargroup", cleargroup_cmd))
 application.add_handler(CommandHandler("deleteindex", deleteindex_cmd))
-application.add_handler(CommandHandler("indexchannel", index_channel_cmd))
 application.add_handler(CommandHandler("scanfile", scanfile_cmd))
+application.add_handler(CommandHandler("indexchannel", index_channel_cmd))
 application.run_polling(
     allowed_updates=["message", "callback_query", "inline_query"],
     drop_pending_updates=True,
