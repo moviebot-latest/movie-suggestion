@@ -563,17 +563,6 @@ def _dedup_keep_one_per_variant(rows: list) -> list:
     return out
 
 def get_omdb(title, by_id=False, year=None, media_type=None):
-    cache_key = (
-        "omdb",
-        str(title).strip().lower(),
-        bool(by_id),
-        str(year or ""),
-        str(media_type or "")
-    )
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-
     try:
         param = "i" if by_id else "t"
         url = f"https://www.omdbapi.com/?{param}={quote(title)}&apikey={OMDB_API}&plot=full"
@@ -587,9 +576,7 @@ def get_omdb(title, by_id=False, year=None, media_type=None):
         data = r.json()
         _cache_put(cache_key, data)
         return data
-    except Exception as e:
-        print(f"[OMDB] {e}")
-        return None
+    except: return None
 
 def get_omdb_search(query, year=None):
     cache_key = ("omdb_search", str(query).strip().lower(), str(year or ""))
@@ -1477,9 +1464,6 @@ async def _send_movie_card(update, context, data, reply_to=None, is_search=False
 
     msg_obj = reply_to if reply_to else update.message
 
-    # Temporary keyboard is shown only until the final keyboard is installed.
-    # Every temporary callback is handled by pending_button_cb, which resolves
-    # the current poster message_id before calling the real callback.
     temp_keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎬 Direct Video ⚡", callback_data="gv_pending")],
         [InlineKeyboardButton("🎬 Trailer",   url=trailer),
@@ -3322,60 +3306,87 @@ async def grp_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /index_channel command — bulk index existing messages ──
 async def _index_channel_worker(status_msg, target_chat: int, limit: int, source_chat_id: int, bot):
     """
-    Index from the START of the chat history.
-
-    `limit` is the maximum number of message IDs to inspect.
-
-    Already-indexed message IDs are loaded once before scanning. Those messages
-    are skipped without forwarding them again, so repeated /index_channel runs
-    do not waste Telegram API calls or re-run AI extraction.
+    Background worker that scans a group/channel for existing video/document
+    messages and indexes them. Runs as an asyncio task so it never blocks
+    the bot's polling loop or the web service's health checks.
     """
     indexed = 0
-    already_indexed = 0
     skipped = 0
-    errors = 0
-    batch = 0
-    scanned = 0
-    check_id = 1
+    errors  = 0
+    batch   = 0
 
-    # Load the existing IDs for this chat once. This prevents already-indexed
-    # messages from being forwarded/scanned again on subsequent runs.
-    try:
-        existing_rows = await asyncio.to_thread(
-            _db_grp_fetch,
-            "SELECT message_id FROM group_files WHERE chat_id=? AND message_id<=?",
-            (target_chat, limit),
-        )
-        indexed_ids = {int(r["message_id"]) for r in existing_rows if r.get("message_id") is not None}
-    except Exception as e:
-        # If the lookup fails, do not silently skip potentially new files.
-        indexed_ids = set()
-        print(f"⚠️ Existing-index lookup failed; scanning normally: {e}")
+    # Find the highest reachable message ID two ways and take the best of
+    # both: (1) walk up from 1 — this is what actually finds small/new
+    # chats (a handful of messages), which large fixed probe points always
+    # miss, and it tolerates gaps like an unforwardable "channel created"
+    # service message; (2) probe a few big numbers ascending, for
+    # established chats with far more messages than a linear walk could
+    # reach quickly. Neither call is exact — the Bot API has no direct
+    # "highest message ID" lookup — but together they cover both ends.
+    async def _probe_ok(mid: int) -> bool:
+        try:
+            fwd = await asyncio.wait_for(
+                bot.forward_message(
+                    chat_id=source_chat_id, from_chat_id=target_chat,
+                    message_id=mid, disable_notification=True,
+                ),
+                timeout=10,
+            )
+            try:
+                await fwd.delete()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
 
-    while scanned < limit:
-        # Already indexed -> count it, but do NOT call Telegram forward_message.
-        if check_id in indexed_ids:
-            already_indexed += 1
-            scanned += 1
-            check_id += 1
-            batch += 1
+    latest_id = 0
+    for mid in range(1, 51):
+        if await _probe_ok(mid):
+            latest_id = mid
+        await asyncio.sleep(0.05)
 
-            if batch >= 10:
-                batch = 0
-                try:
-                    await status_msg.edit_text(
-                        f"📦 *Indexing* `{target_chat}`\n"
-                        f"⏳ Checked: `{scanned}/{limit}` messages\n"
-                        f"✅ New indexed: `{indexed}`\n"
-                        f"♻️ Already indexed: `{already_indexed}`\n"
-                        f"⏩ Skipped: `{skipped}`\n"
-                        f"❌ Errors: `{errors}`",
-                        parse_mode="Markdown",
-                    )
-                except Exception:
-                    pass
-            continue
+    # Checkpoints alone can undershoot: a channel with, say, 150 messages
+    # would pass the 99 checkpoint but fail 199, leaving messages 100-150
+    # completely unseen. So after finding the last checkpoint that
+    # succeeds, refine forward from it one ID at a time (tolerating gaps
+    # like deleted messages) until the true top is reached — this finds
+    # the real latest message regardless of exactly where it falls.
+    checkpoints = [99, 199, 349, 499, 749, 999, 1499, 1999, 2999,
+                   4999, 6999, 9999, 14999, 19999, 29999, 49999]
+    last_checkpoint_ok = 0
+    for cp in checkpoints:
+        if await _probe_ok(cp):
+            last_checkpoint_ok = cp
+        else:
+            break
+        await asyncio.sleep(0.05)
 
+    refine_from = max(latest_id, last_checkpoint_ok)
+    if refine_from > 0:
+        probe, misses, steps = refine_from, 0, 0
+        while misses < 15 and steps < 3000:
+            probe  += 1
+            steps  += 1
+            if await _probe_ok(probe):
+                latest_id = probe
+                misses = 0
+            else:
+                misses += 1
+            await asyncio.sleep(0.03)
+    latest_id = max(latest_id, last_checkpoint_ok)
+
+    if latest_id == 0:
+        # Nothing forwardable anywhere in this search — very unusual,
+        # but give the scan loop real room to work with instead of dying
+        # after a single attempt.
+        latest_id = limit + 20
+
+    scanned  = 0
+    check_id = latest_id
+    consecutive_not_found = 0
+
+    while scanned < limit and check_id > 0:
         try:
             fwd = await asyncio.wait_for(
                 bot.forward_message(
@@ -3386,6 +3397,7 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
                 ),
                 timeout=10,
             )
+            consecutive_not_found = 0
 
             if fwd.video or fwd.document:
                 caption = fwd.caption or ""
@@ -3393,26 +3405,21 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
                     caption = getattr(fwd.document, "file_name", "") or ""
 
                 if caption.strip():
-                    parsed = _parse_caption(caption)
+                    parsed    = _parse_caption(caption)
                     raw_title = parsed["clean_title"]
 
-                    ai_info = await _ai_extract_title_info(caption, parsed)
-                    clean_title = (ai_info["clean_title"] or raw_title).lower().strip()
-                    final_year = ai_info["year"] or parsed["year"]
+                    ai_info      = await _ai_extract_title_info(caption, parsed)
+                    clean_title  = (ai_info["clean_title"] or raw_title).lower().strip()
+                    final_year   = ai_info["year"] or parsed["year"]
                     content_type = ai_info["content_type"]
-                    confidence = ai_info["confidence"]
+                    confidence   = ai_info["confidence"]
 
                     if clean_title and len(clean_title) > 2:
-                        file_obj = fwd.video or fwd.document
+                        file_obj  = fwd.video or fwd.document
                         file_type = "video" if fwd.video else "document"
-                        size_mb = (
-                            round(
-                                getattr(file_obj, "file_size", 0) / (1024 * 1024),
-                                1,
-                            )
-                            if getattr(file_obj, "file_size", 0)
-                            else 0.0
-                        )
+                        size_mb   = round(
+                            getattr(file_obj, "file_size", 0) / (1024 * 1024), 1
+                        ) if getattr(file_obj, "file_size", 0) else 0.0
 
                         try:
                             await asyncio.to_thread(
@@ -3437,18 +3444,15 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
                                     confidence,
                                     parsed["season_ep"],
                                     time.time(),
-                                ),
+                                )
                             )
                             indexed += 1
-                            indexed_ids.add(check_id)
-                        except Exception as e:
-                            errors += 1
-                            print(f"⚠️ Index DB error for message {check_id}: {e}")
+                        except Exception:
+                            skipped += 1
                     else:
                         skipped += 1
                 else:
                     skipped += 1
-
             try:
                 await fwd.delete()
             except Exception:
@@ -3456,46 +3460,49 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
 
         except asyncio.TimeoutError:
             errors += 1
+            if errors > 20:
+                break
         except Exception as e:
             err_str = str(e).lower()
             if "message to forward not found" in err_str or "invalid" in err_str:
-                skipped += 1
+                consecutive_not_found += 1
+                # Long stretch of missing IDs usually means we've scanned
+                # past the start of the chat's history — stop early instead
+                # of burning through the rest of the ID range one by one.
+                if consecutive_not_found > 200:
+                    break
             else:
                 errors += 1
-                print(f"⚠️ Index message {check_id} error: {e}")
+                if errors > 20:
+                    break
 
-        scanned += 1
-        check_id += 1
-        batch += 1
+        check_id -= 1
+        scanned  += 1
+        batch    += 1
+        await asyncio.sleep(0.05)  # stay well clear of flood limits over a longer scan
 
-        if batch >= 10:
+        if batch >= 50:
             batch = 0
             try:
                 await status_msg.edit_text(
                     f"📦 *Indexing* `{target_chat}`\n"
-                    f"⏳ Checked: `{scanned}/{limit}` messages\n"
-                    f"✅ New indexed: `{indexed}`\n"
-                    f"♻️ Already indexed: `{already_indexed}`\n"
-                    f"⏩ Skipped: `{skipped}`\n"
-                    f"❌ Errors: `{errors}`",
-                    parse_mode="Markdown",
+                    f"⏳ Progress: `{scanned}/{limit}`\n"
+                    f"✅ Indexed: `{indexed}` | ⏩ Skipped: `{skipped}`",
+                    parse_mode="Markdown"
                 )
             except Exception:
                 pass
-
-        await asyncio.sleep(0.05)
+            await asyncio.sleep(0.5)
 
     try:
         await status_msg.edit_text(
             f"✅ *Index Complete!*\n\n"
             f"📦 Chat: `{target_chat}`\n"
-            f"🔎 Checked: `{scanned}` messages\n"
-            f"✅ New indexed: `{indexed}` files\n"
-            f"♻️ Already indexed: `{already_indexed}`\n"
+            f"✅ Indexed: `{indexed}` files\n"
             f"⏩ Skipped: `{skipped}`\n"
             f"❌ Errors: `{errors}`\n\n"
-            f"_Next run mein already-indexed messages dobara scan nahi honge._",
-            parse_mode="Markdown",
+            f"_Ab users movie search karenge toh direct link milega!_",
+            parse_mode="Markdown"
         )
     except Exception:
         pass
@@ -3505,8 +3512,8 @@ async def index_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /index_channel <chat_id> [limit]
     Admin command: bulk index existing messages from a group/channel.
-    Default limit: 500 messages. Scans message IDs from the beginning of the chat.
-    Runs as a background task so it never blocks the bot's polling loop.
+    Default limit: 500 messages. Runs as a background task so it never
+    blocks the bot's polling loop or the web service's health checks.
     """
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("🔒 Admin only.", parse_mode="Markdown")
@@ -4086,14 +4093,8 @@ async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = query.from_user.id
     await query.answer()
 
-    # The first poster keyboard briefly uses gv_pending before the real
-    # keyboard is installed. If the user taps during that tiny window, use
-    # the poster message id itself; its movie data is stored under the same
-    # id immediately after sending the poster.
     msg_id = query.data.replace("gv_", "")
-    if msg_id == "pending":
-        msg_id = str(query.message.message_id)
-    stored = context.user_data.get(msg_id)
+    stored = context.user_data.get(msg_id) if msg_id != "pending" else None
 
     if not stored or not stored.get("title"):
         await query.message.reply_text(
@@ -4115,33 +4116,6 @@ async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
     await animate_search(loader)
 
     grp_results = await grp_search(search_name, limit=20)
-
-    # Fast local fallback: Direct Video must still work when the AI spelling
-    # helper/semantic reranker fails or changes the query. Search the actual
-    # indexed SQLite rows directly using title words + fuzzy scoring.
-    if not grp_results:
-        try:
-            title_only, query_year = _extract_year(search_name.lower().strip())
-            words = [w for w in re.findall(r"\w+", title_only) if len(w) > 2]
-            if words:
-                where = " OR ".join(["clean_title LIKE ?"] * len(words))
-                rows = await asyncio.to_thread(
-                    _db_grp_fetch,
-                    f"SELECT * FROM group_files WHERE {where} LIMIT 100",
-                    tuple(f"%{w}%" for w in words),
-                )
-                fallback = []
-                for r in rows:
-                    score = _grp_title_similarity(title_only, r.get("clean_title", ""),
-                                                   query_year=query_year, row_year=r.get("year"))
-                    if score >= 0.25:
-                        r["_score"] = score
-                        fallback.append(r)
-                fallback.sort(key=lambda r: r["_score"], reverse=True)
-                grp_results = _dedup_keep_one_per_variant(fallback[:20])
-        except Exception as e:
-            print(f"⚠️ Direct Video local fallback error: {e}")
-
     try: await loader.delete()
     except: pass
 
@@ -4213,60 +4187,6 @@ async def pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await query.message.reply_text("❌ Load nahi hua. Try again.", parse_mode="Markdown")
 
-
-# Resolve buttons tapped during the tiny window before the real movie
-# keyboard is installed. This makes ALL *_tmp buttons functional.
-async def pending_button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    # Do NOT answer here: the real callback handler below answers the same
-    # Telegram callback. Answering twice can create a second API request/error.
-    action = query.data[:-4]  # remove "_tmp"
-    msg_id = str(query.message.message_id)
-    movie_data = context.user_data.get(msg_id)
-
-    if not movie_data:
-        await query.message.reply_text(
-            "⚠️ Movie session expired. Movie naam dobara bhejo.",
-            parse_mode="Markdown",
-        )
-        return
-
-    # Build the same payload used by the final keyboard.
-    if action == "s":
-        query.data = f"srv_{msg_id}"
-        await servers_cb(update, context)
-    elif action == "sim":
-        query.data = f"sim_{msg_id}"
-        await similar_cb(update, context)
-    elif action == "rev":
-        query.data = f"rev_{movie_data.get('imdb_id', '')}"
-        await review_cb(update, context)
-    elif action == "fun":
-        query.data = f"fun_{movie_data.get('imdb_id', '')}"
-        await funfact_cb(update, context)
-    elif action == "rate":
-        query.data = f"rate_{msg_id}"
-        await rate_cb(update, context)
-    elif action == "frev":
-        query.data = f"frev_{msg_id}"
-        await fullreview_cb(update, context)
-    elif action == "mood_match":
-        query.data = f"mood_match_{msg_id}"
-        await moodmatch_cb(update, context)
-    elif action == "cast":
-        query.data = f"cast_{msg_id}"
-        await castanalysis_cb(update, context)
-    elif action == "trivia":
-        query.data = f"trivia_{msg_id}"
-        await trivia_cb(update, context)
-    elif action == "pkg":
-        query.data = f"pkg_{msg_id}"
-        await fullpackage_cb(update, context)
-    else:
-        try:
-            await query.answer("⚠️ Button session expired.", show_alert=True)
-        except Exception:
-            pass
 
 # ═══════════════════════════════════════════════════════════════════
 #   AI REVIEW / FUN FACTS / RATE / SIMILAR / SERVERS / BACK CALLBACKS
@@ -5755,9 +5675,7 @@ async def adm_addadmin_recv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loader = await update.message.reply_text("⚙️ Processing...\n" + progress_bar(1, 3), parse_mode="Markdown")
     if len(parts) >= 2:
         try:
-            hours = int(parts[1])
-            if hours <= 0:
-                raise ValueError("hours must be positive")
+            hours  = int(parts[1])
             expiry = now_ist().timestamp() + (hours * 3600)
             admins[str(target_id)] = {"id": target_id, "type": "temporary", "hours": hours,
                                       "expiry": expiry, "added_by": update.effective_user.id,
@@ -5943,19 +5861,12 @@ async def adm_servers_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📡 *Server Manager*\n━━━━━━━━━━━━━━━━━━\n\n"
     for i in range(1, 7):
         text += f"*{i}.* _{servers[f's{i}']['name']}_\n`{servers[f's{i}']['url']}`\n\n"
-    keyboard = []
-    for i in range(1, 7):
-        info = servers.get(f"s{i}", DEFAULT_SERVERS[f"s{i}"])
-        raw_url = str(info.get("url", "")).strip()
-        # Telegram URL buttons require an absolute http/https URL.
-        if not raw_url.startswith(("http://", "https://")):
-            raw_url = DEFAULT_SERVERS[f"s{i}"]["url"]
-        keyboard.append([
-            InlineKeyboardButton(f"🌐 Open S{i}", url=raw_url),
-            InlineKeyboardButton(f"✏️ Edit S{i}", callback_data=f"adm_edit_s{i}"),
-        ])
+    keyboard = [
+        [InlineKeyboardButton(f"✏️ S{i} — {servers[f's{i}']['name']}", callback_data=f"adm_edit_s{i}")]
+        for i in range(1, 7)
+    ]
     keyboard.append([InlineKeyboardButton("🔄 Reset Default", callback_data="adm_reset")])
-    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="adm_back")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back",          callback_data="adm_back")])
     sent = await query.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
     asyncio.create_task(auto_delete(sent, 60))
 
@@ -5974,18 +5885,11 @@ async def adm_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def adm_recv_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return ConversationHandler.END
     url = update.message.text.strip()
-    if not url.startswith(("http://", "https://")):
-        await update.message.reply_text(
-            "❌ Invalid URL. http:// ya https:// se start hona chahiye.\n/cancel"
-        )
+    if not url.startswith("http"):
+        await update.message.reply_text("❌ Invalid URL. Try again or /cancel")
         return W_URL
     context.user_data["new_url"] = url
-    sk = context.user_data.get("editing_server")
-    if sk not in DEFAULT_SERVERS:
-        context.user_data.pop("editing_server", None)
-        context.user_data.pop("new_url", None)
-        await update.message.reply_text("⚠️ Server edit session expire ho gaya. /admin se dobara try karo.")
-        return ConversationHandler.END
+    sk = context.user_data["editing_server"]
     await update.message.reply_text(
         f"✅ URL saved!\n\n📝 Display name bhejo (current: `{load_servers()[sk]['name']}`):\n/cancel",
         parse_mode="Markdown")
@@ -5994,17 +5898,9 @@ async def adm_recv_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def adm_recv_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return ConversationHandler.END
     global bot_servers
-    name = update.message.text.strip()
-    if not name:
-        await update.message.reply_text("❌ Display name empty nahi ho sakta. Dobara bhejo ya /cancel.")
-        return W_NAME
-    url = context.user_data.get("new_url", "").strip()
-    sk  = context.user_data.get("editing_server")
-    if sk not in DEFAULT_SERVERS or not url.startswith(("http://", "https://")):
-        context.user_data.pop("editing_server", None)
-        context.user_data.pop("new_url", None)
-        await update.message.reply_text("⚠️ Server edit session invalid/expired. /admin se dobara try karo.")
-        return ConversationHandler.END
+    name    = update.message.text.strip()
+    url     = context.user_data["new_url"]
+    sk      = context.user_data["editing_server"]
     loader  = await update.message.reply_text("💾 Saving...\n" + progress_bar(0, 3), parse_mode="Markdown")
     await animate_generic(loader, FRAMES["save"])
     servers = load_json("servers", {k: v.copy() for k, v in DEFAULT_SERVERS.items()})
@@ -6055,10 +5951,9 @@ async def adm_maint_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not is_admin(query.from_user.id): return ConversationHandler.END
     maint = load_json("maintenance", {"active": False, "message": ""})
-    current = str(maint.get("message", "")).strip() or "(empty)"
     await query.message.reply_text(
-        f"✏️ Current message:\n{current}\n\n📝 Naya message bhejo:\n/cancel"
-    )
+        f"✏️ Current message:\n_{maint.get('message', '')}_\n\n📝 Naya message:\n/cancel",
+        parse_mode="Markdown")
     return W_MAINT_MSG
 
 async def adm_recv_maint_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6492,7 +6387,6 @@ application = (
 )
 
 master_conv = ConversationHandler(
-    allow_reentry=True,
     entry_points=[
         CallbackQueryHandler(adm_edit,             pattern="^adm_edit_s"),
         CallbackQueryHandler(adm_maint_msg,        pattern="^adm_maint_msg$"),
@@ -6655,15 +6549,6 @@ application.add_handler(CallbackQueryHandler(upcom_add_cb,      pattern="^upcom_
 
 # ── User callbacks ──
 application.add_handler(master_conv)
-
-# Temporary movie-card callbacks. These MUST be before the broad ^sim_/^rev_
-# handlers so the *_tmp race is resolved with the current poster message ID.
-application.add_handler(
-    CallbackQueryHandler(
-        pending_button_cb,
-        pattern=r"^(s|sim|rev|fun|rate|frev|mood_match|cast|trivia|pkg)_tmp$",
-    )
-)
 application.add_handler(CallbackQueryHandler(start_btn_cb,   pattern="^cmd_(?!suggest|plotsearch|mood|compare)"))
 application.add_handler(CallbackQueryHandler(start_btn_cb,   pattern="^open_admin$"))
 application.add_handler(CallbackQueryHandler(wl_save_cb,     pattern="^wl_save\\|"))
@@ -6692,17 +6577,6 @@ application.add_handler(CallbackQueryHandler(grp_confirm_no_cb,  pattern="^grp_c
 
 # ── Direct Video button on poster card ──
 application.add_handler(CallbackQueryHandler(grp_direct_video_cb, pattern="^gv_"))
-
-# ── Unknown callback safety net — MUST stay LAST among callback handlers ──
-async def unknown_callback_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    try:
-        await query.answer("⚠️ This button is currently unavailable.", show_alert=True)
-    except Exception:
-        pass
-    print(f"⚠️ Unhandled callback_data: {query.data!r}")
-
-application.add_handler(CallbackQueryHandler(unknown_callback_cb))
 
 # ── Group file auto-indexer (video/document in watched groups) ──
 application.add_handler(MessageHandler(
@@ -6737,10 +6611,7 @@ print(f"   TMDB: {'✅' if TMDB_API else '⚠️ optional'}")
 # This runs a tiny stdlib-only HTTP server in a background thread just
 # to satisfy that check — no Flask/uvicorn dependency needed.
 def _start_render_port_binder():
-    try:
-        port = int(os.getenv("PORT", "10000"))
-    except (TypeError, ValueError):
-        port = 10000
+    port = int(os.getenv("PORT", "10000"))
 
     class _Health(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
