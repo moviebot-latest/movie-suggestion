@@ -6284,9 +6284,15 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the complete help menu in ONE Telegram message.
+
+    Existing commands are preserved; Group Management is included on the
+    same page instead of being sent as a second message.
+    """
     ai_status = "✅ Groq AI Active" if GROQ_API else "⚠️ Set GROQ_API for AI features"
     healer_status = "✅ Domain Healer v7 Active" if _healer else "⚠️ Healer not initialized"
-    await update.message.reply_text(
+
+    help_text = (
         f"ℹ️ *CINEBOT HELP*\n\n"
         f"🤖 *AI Status:* {ai_status}\n"
         f"🔧 *Healer:* {healer_status}\n\n"
@@ -6335,26 +6341,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📡 /checkservers — Manual server health check\n"
         "📊 /serverstats  — Uptime stats\n"
         "🔧 /healerlog    — Domain heal history\n"
-        "📦 /index_channel — Group ka index banao\n"
-        "📊 /grpstats     — Index stats\n"
-        "🔍 /grptitles    — See actual stored titles (debug search misses)\n"
-        "🗑 /clrindex     — Index clear karo\n"
         "📢 /sendalert    — Alert all users\n"
         "👑 /addadmin     — Add admin\n"
         "🚫 /removeadmin  — Remove admin\n"
         "📋 /admins       — List admins\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "🎯 *Movie card pe buttons:*\n"
-        "📝 Full Review • 🎭 Mood Match\n"
-        "🌟 Cast Analysis • ❓ Trivia Quiz\n"
-        "🔥 Full AI Package\n\n"
-        "🦁 *Brave Browser = No Ads!*",
-        parse_mode="Markdown")
-
-
-    # Group Management commands — appended without removing existing help text.
-    group_help = (
-        "\n\n👥 *Group Management*\n"
+        "👥 *Group Management*\n"
         "`/addgroup <group_id>` — new group add + index\n"
         "`/allgroups` — added groups ki list\n"
         "`/removegroup <group_id>` — group remove\n"
@@ -6366,12 +6358,22 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/scanfile <group_id> <message_id>` — sirf single file scan\n"
         "`/grptitles` — group titles list\n"
         "`/grpstats` — group/index stats\n"
+        "`/index_channel <group_id> <limit>` — legacy index command\n"
+        "`/clrindex` — legacy index clear command\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🎯 *Movie card pe buttons:*\n"
+        "📝 Full Review • 🎭 Mood Match\n"
+        "🌟 Cast Analysis • ❓ Trivia Quiz\n"
+        "🔥 Full AI Package\n\n"
+        "🦁 *Brave Browser = No Ads!*"
     )
-    try:
-        await update.message.reply_text(group_help, parse_mode="Markdown")
-    except Exception:
-        pass
 
+    try:
+        await update.message.reply_text(help_text, parse_mode="Markdown")
+    except Exception:
+        # Telegram may reject Markdown if a future command description contains
+        # an unescaped character. Retry as plain text so /help never silently fails.
+        await update.message.reply_text(help_text.replace("`", ""), parse_mode=None)
 
 
 # ═══════════════════════════════════════════════════════════════════
