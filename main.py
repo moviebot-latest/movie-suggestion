@@ -563,6 +563,17 @@ def _dedup_keep_one_per_variant(rows: list) -> list:
     return out
 
 def get_omdb(title, by_id=False, year=None, media_type=None):
+    cache_key = (
+        "omdb",
+        str(title).strip().lower(),
+        bool(by_id),
+        str(year or ""),
+        str(media_type or "")
+    )
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         param = "i" if by_id else "t"
         url = f"https://www.omdbapi.com/?{param}={quote(title)}&apikey={OMDB_API}&plot=full"
@@ -576,7 +587,9 @@ def get_omdb(title, by_id=False, year=None, media_type=None):
         data = r.json()
         _cache_put(cache_key, data)
         return data
-    except: return None
+    except Exception as e:
+        print(f"[OMDB] {e}")
+        return None
 
 def get_omdb_search(query, year=None):
     cache_key = ("omdb_search", str(query).strip().lower(), str(year or ""))
@@ -3306,87 +3319,60 @@ async def grp_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /index_channel command — bulk index existing messages ──
 async def _index_channel_worker(status_msg, target_chat: int, limit: int, source_chat_id: int, bot):
     """
-    Background worker that scans a group/channel for existing video/document
-    messages and indexes them. Runs as an asyncio task so it never blocks
-    the bot's polling loop or the web service's health checks.
+    Index from the START of the chat history.
+
+    `limit` is the maximum number of message IDs to inspect.
+
+    Already-indexed message IDs are loaded once before scanning. Those messages
+    are skipped without forwarding them again, so repeated /index_channel runs
+    do not waste Telegram API calls or re-run AI extraction.
     """
     indexed = 0
+    already_indexed = 0
     skipped = 0
-    errors  = 0
-    batch   = 0
+    errors = 0
+    batch = 0
+    scanned = 0
+    check_id = 1
 
-    # Find the highest reachable message ID two ways and take the best of
-    # both: (1) walk up from 1 — this is what actually finds small/new
-    # chats (a handful of messages), which large fixed probe points always
-    # miss, and it tolerates gaps like an unforwardable "channel created"
-    # service message; (2) probe a few big numbers ascending, for
-    # established chats with far more messages than a linear walk could
-    # reach quickly. Neither call is exact — the Bot API has no direct
-    # "highest message ID" lookup — but together they cover both ends.
-    async def _probe_ok(mid: int) -> bool:
-        try:
-            fwd = await asyncio.wait_for(
-                bot.forward_message(
-                    chat_id=source_chat_id, from_chat_id=target_chat,
-                    message_id=mid, disable_notification=True,
-                ),
-                timeout=10,
-            )
-            try:
-                await fwd.delete()
-            except Exception:
-                pass
-            return True
-        except Exception:
-            return False
+    # Load the existing IDs for this chat once. This prevents already-indexed
+    # messages from being forwarded/scanned again on subsequent runs.
+    try:
+        existing_rows = await asyncio.to_thread(
+            _db_grp_fetch,
+            "SELECT message_id FROM group_files WHERE chat_id=? AND message_id<=?",
+            (target_chat, limit),
+        )
+        indexed_ids = {int(r["message_id"]) for r in existing_rows if r.get("message_id") is not None}
+    except Exception as e:
+        # If the lookup fails, do not silently skip potentially new files.
+        indexed_ids = set()
+        print(f"⚠️ Existing-index lookup failed; scanning normally: {e}")
 
-    latest_id = 0
-    for mid in range(1, 51):
-        if await _probe_ok(mid):
-            latest_id = mid
-        await asyncio.sleep(0.05)
+    while scanned < limit:
+        # Already indexed -> count it, but do NOT call Telegram forward_message.
+        if check_id in indexed_ids:
+            already_indexed += 1
+            scanned += 1
+            check_id += 1
+            batch += 1
 
-    # Checkpoints alone can undershoot: a channel with, say, 150 messages
-    # would pass the 99 checkpoint but fail 199, leaving messages 100-150
-    # completely unseen. So after finding the last checkpoint that
-    # succeeds, refine forward from it one ID at a time (tolerating gaps
-    # like deleted messages) until the true top is reached — this finds
-    # the real latest message regardless of exactly where it falls.
-    checkpoints = [99, 199, 349, 499, 749, 999, 1499, 1999, 2999,
-                   4999, 6999, 9999, 14999, 19999, 29999, 49999]
-    last_checkpoint_ok = 0
-    for cp in checkpoints:
-        if await _probe_ok(cp):
-            last_checkpoint_ok = cp
-        else:
-            break
-        await asyncio.sleep(0.05)
+            if batch >= 10:
+                batch = 0
+                try:
+                    await status_msg.edit_text(
+                        f"📦 *Indexing* `{target_chat}`\n"
+                        f"⏳ Checked: `{scanned}/{limit}` messages\n"
+                        f"✅ New indexed: `{indexed}`\n"
+                        f"♻️ Already indexed: `{already_indexed}`\n"
+                        f"⏩ Skipped: `{skipped}`\n"
+                        f"❌ Errors: `{errors}`",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+            continue
 
-    refine_from = max(latest_id, last_checkpoint_ok)
-    if refine_from > 0:
-        probe, misses, steps = refine_from, 0, 0
-        while misses < 15 and steps < 3000:
-            probe  += 1
-            steps  += 1
-            if await _probe_ok(probe):
-                latest_id = probe
-                misses = 0
-            else:
-                misses += 1
-            await asyncio.sleep(0.03)
-    latest_id = max(latest_id, last_checkpoint_ok)
-
-    if latest_id == 0:
-        # Nothing forwardable anywhere in this search — very unusual,
-        # but give the scan loop real room to work with instead of dying
-        # after a single attempt.
-        latest_id = limit + 20
-
-    scanned  = 0
-    check_id = latest_id
-    consecutive_not_found = 0
-
-    while scanned < limit and check_id > 0:
         try:
             fwd = await asyncio.wait_for(
                 bot.forward_message(
@@ -3397,7 +3383,6 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
                 ),
                 timeout=10,
             )
-            consecutive_not_found = 0
 
             if fwd.video or fwd.document:
                 caption = fwd.caption or ""
@@ -3405,21 +3390,26 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
                     caption = getattr(fwd.document, "file_name", "") or ""
 
                 if caption.strip():
-                    parsed    = _parse_caption(caption)
+                    parsed = _parse_caption(caption)
                     raw_title = parsed["clean_title"]
 
-                    ai_info      = await _ai_extract_title_info(caption, parsed)
-                    clean_title  = (ai_info["clean_title"] or raw_title).lower().strip()
-                    final_year   = ai_info["year"] or parsed["year"]
+                    ai_info = await _ai_extract_title_info(caption, parsed)
+                    clean_title = (ai_info["clean_title"] or raw_title).lower().strip()
+                    final_year = ai_info["year"] or parsed["year"]
                     content_type = ai_info["content_type"]
-                    confidence   = ai_info["confidence"]
+                    confidence = ai_info["confidence"]
 
                     if clean_title and len(clean_title) > 2:
-                        file_obj  = fwd.video or fwd.document
+                        file_obj = fwd.video or fwd.document
                         file_type = "video" if fwd.video else "document"
-                        size_mb   = round(
-                            getattr(file_obj, "file_size", 0) / (1024 * 1024), 1
-                        ) if getattr(file_obj, "file_size", 0) else 0.0
+                        size_mb = (
+                            round(
+                                getattr(file_obj, "file_size", 0) / (1024 * 1024),
+                                1,
+                            )
+                            if getattr(file_obj, "file_size", 0)
+                            else 0.0
+                        )
 
                         try:
                             await asyncio.to_thread(
@@ -3444,15 +3434,18 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
                                     confidence,
                                     parsed["season_ep"],
                                     time.time(),
-                                )
+                                ),
                             )
                             indexed += 1
-                        except Exception:
-                            skipped += 1
+                            indexed_ids.add(check_id)
+                        except Exception as e:
+                            errors += 1
+                            print(f"⚠️ Index DB error for message {check_id}: {e}")
                     else:
                         skipped += 1
                 else:
                     skipped += 1
+
             try:
                 await fwd.delete()
             except Exception:
@@ -3460,49 +3453,46 @@ async def _index_channel_worker(status_msg, target_chat: int, limit: int, source
 
         except asyncio.TimeoutError:
             errors += 1
-            if errors > 20:
-                break
         except Exception as e:
             err_str = str(e).lower()
             if "message to forward not found" in err_str or "invalid" in err_str:
-                consecutive_not_found += 1
-                # Long stretch of missing IDs usually means we've scanned
-                # past the start of the chat's history — stop early instead
-                # of burning through the rest of the ID range one by one.
-                if consecutive_not_found > 200:
-                    break
+                skipped += 1
             else:
                 errors += 1
-                if errors > 20:
-                    break
+                print(f"⚠️ Index message {check_id} error: {e}")
 
-        check_id -= 1
-        scanned  += 1
-        batch    += 1
-        await asyncio.sleep(0.05)  # stay well clear of flood limits over a longer scan
+        scanned += 1
+        check_id += 1
+        batch += 1
 
-        if batch >= 50:
+        if batch >= 10:
             batch = 0
             try:
                 await status_msg.edit_text(
                     f"📦 *Indexing* `{target_chat}`\n"
-                    f"⏳ Progress: `{scanned}/{limit}`\n"
-                    f"✅ Indexed: `{indexed}` | ⏩ Skipped: `{skipped}`",
-                    parse_mode="Markdown"
+                    f"⏳ Checked: `{scanned}/{limit}` messages\n"
+                    f"✅ New indexed: `{indexed}`\n"
+                    f"♻️ Already indexed: `{already_indexed}`\n"
+                    f"⏩ Skipped: `{skipped}`\n"
+                    f"❌ Errors: `{errors}`",
+                    parse_mode="Markdown",
                 )
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
+
+        await asyncio.sleep(0.05)
 
     try:
         await status_msg.edit_text(
             f"✅ *Index Complete!*\n\n"
             f"📦 Chat: `{target_chat}`\n"
-            f"✅ Indexed: `{indexed}` files\n"
+            f"🔎 Checked: `{scanned}` messages\n"
+            f"✅ New indexed: `{indexed}` files\n"
+            f"♻️ Already indexed: `{already_indexed}`\n"
             f"⏩ Skipped: `{skipped}`\n"
             f"❌ Errors: `{errors}`\n\n"
-            f"_Ab users movie search karenge toh direct link milega!_",
-            parse_mode="Markdown"
+            f"_Next run mein already-indexed messages dobara scan nahi honge._",
+            parse_mode="Markdown",
         )
     except Exception:
         pass
@@ -3512,8 +3502,8 @@ async def index_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /index_channel <chat_id> [limit]
     Admin command: bulk index existing messages from a group/channel.
-    Default limit: 500 messages. Runs as a background task so it never
-    blocks the bot's polling loop or the web service's health checks.
+    Default limit: 500 messages. Scans message IDs from the beginning of the chat.
+    Runs as a background task so it never blocks the bot's polling loop.
     """
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("🔒 Admin only.", parse_mode="Markdown")
@@ -4087,14 +4077,29 @@ async def grp_confirm_no_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _direct_progress_update(message, label, pct):
+    try:
+        filled=max(0,min(10,int(pct/10)))
+        bar='█'*filled+'·'*(10-filled)
+        await message.edit_text(f"{label}\n`{pct}%` [{bar}]", parse_mode="Markdown")
+    except Exception:
+        pass
+
+
 # ── Callback: user tapped "🎬 Direct Video ⚡" on the poster card ──
 async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     user_id = query.from_user.id
     await query.answer()
 
+    # The first poster keyboard briefly uses gv_pending before the real
+    # keyboard is installed. If the user taps during that tiny window, use
+    # the poster message id itself; its movie data is stored under the same
+    # id immediately after sending the poster.
     msg_id = query.data.replace("gv_", "")
-    stored = context.user_data.get(msg_id) if msg_id != "pending" else None
+    if msg_id == "pending":
+        msg_id = str(query.message.message_id)
+    stored = context.user_data.get(msg_id)
 
     if not stored or not stored.get("title"):
         await query.message.reply_text(
@@ -4113,13 +4118,44 @@ async def grp_direct_video_cb(update: Update, context: ContextTypes.DEFAULT_TYPE
         text="⏳ *Finding...*\n" + progress_bar(0, 6),
         parse_mode="Markdown",
     )
-    await animate_search(loader)
+    await _direct_progress_update(loader, "🔎 Video/file search start", 25)
 
     grp_results = await grp_search(search_name, limit=20)
+    await _direct_progress_update(loader, "📂 Group index/database matching", 50)
+
+    # Fast local fallback: Direct Video must still work when the AI spelling
+    # helper/semantic reranker fails or changes the query. Search the actual
+    # indexed SQLite rows directly using title words + fuzzy scoring.
+    if not grp_results:
+        try:
+            title_only, query_year = _extract_year(search_name.lower().strip())
+            words = [w for w in re.findall(r"\w+", title_only) if len(w) > 2]
+            if words:
+                where = " OR ".join(["clean_title LIKE ?"] * len(words))
+                rows = await asyncio.to_thread(
+                    _db_grp_fetch,
+                    f"SELECT * FROM group_files WHERE {where} LIMIT 100",
+                    tuple(f"%{w}%" for w in words),
+                )
+                fallback = []
+                for r in rows:
+                    score = _grp_title_similarity(title_only, r.get("clean_title", ""),
+                                                   query_year=query_year, row_year=r.get("year"))
+                    if score >= 0.25:
+                        r["_score"] = score
+                        fallback.append(r)
+                fallback.sort(key=lambda r: r["_score"], reverse=True)
+                grp_results = _dedup_keep_one_per_variant(fallback[:20])
+        except Exception as e:
+            print(f"⚠️ Direct Video local fallback error: {e}")
+
+    await _direct_progress_update(loader, "🎯 Exact file/message match verified", 75)
+
     try: await loader.delete()
     except: pass
 
     if grp_results:
+        await _direct_progress_update(loader, "📤 Telegram file fetch/send", 100)
         await _grp_auto_send_or_confirm(context, chat_id, grp_results, search_name, title, user_id)
     else:
         closest = await _grp_closest_miss(title)
@@ -6373,6 +6409,281 @@ async def post_init(application):
 # ═══════════════════════════════════════════════════════════════════
 #   APPLICATION BUILD
 # ═══════════════════════════════════════════════════════════════════
+
+
+# --- Restored group-management handlers (preserved from working build) ---
+async def addgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addgroup CHAT_ID [limit] — add a group to the dynamic watch list.
+    If limit is supplied, immediately start a background index of that many
+    messages. Only admins can use it.
+    """
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "❌ Usage: `/addgroup CHAT_ID [limit]`\n"
+            "Example: `/addgroup -1001234567890 500`",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid group ID.")
+        return
+    try:
+        chat = await context.bot.get_chat(chat_id)
+        title = getattr(chat, "title", "") or getattr(chat, "username", "") or ""
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Bot group access check failed:\n`{e}`\n\n"
+            "Bot ko target group mein add/admin karo.",
+            parse_mode="Markdown",
+        )
+        return
+
+    _group_add(chat_id, title)
+    msg = f"✅ Group added: `{chat_id}`\n📝 {title or 'Untitled'}\n"
+    if len(args) >= 2:
+        try:
+            limit = max(1, min(int(args[1]), 5000))
+        except ValueError:
+            await update.message.reply_text(msg + "⚠️ Invalid limit; group add ho gaya, indexing start nahi hui.", parse_mode="Markdown")
+            return
+        status = await update.message.reply_text(
+            msg + f"\n📦 Indexing `{limit}` messages in background...",
+            parse_mode="Markdown",
+        )
+        asyncio.create_task(
+            _index_channel_worker(status, chat_id, limit, update.effective_chat.id, context.bot)
+        )
+    else:
+        await update.message.reply_text(
+            msg + "\n📡 Auto-indexing ON.\n"
+            "Existing files ke liye: `/index_channel {chat_id} 500`",
+            parse_mode="Markdown",
+        )
+
+async def allgroups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    state = _load_group_state()
+    dynamic = state.get("groups", {})
+    stopped = {str(x) for x in state.get("stopped", [])}
+    lines = ["👥 *GROUP LIST*", "━━━━━━━━━━━━━━━━━━"]
+    if not dynamic and not WATCHED_GROUP_IDS:
+        lines.append("⚠️ Dynamic list empty — legacy mode: all groups are watched.")
+    else:
+        if WATCHED_GROUP_IDS:
+            lines.append("⚙️ Env GROUP_IDS: " + ", ".join(map(str, WATCHED_GROUP_IDS)))
+        if dynamic:
+            for gid, info in dynamic.items():
+                status = "⏸ STOPPED" if str(gid) in stopped else "🟢 ACTIVE"
+                title = info.get("title", "") if isinstance(info, dict) else ""
+                lines.append(f"{status} `{gid}` {title}".rstrip())
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def removegroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("❌ Usage: `/removegroup CHAT_ID`", parse_mode="Markdown")
+        return
+    try:
+        chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid group ID.")
+        return
+    _group_remove(chat_id)
+    await update.message.reply_text(
+        f"✅ `{chat_id}` dynamic watch list se remove ho gaya.\n"
+        "⚠️ Existing index delete nahi hua. `/cleargroup` use karo agar index bhi clear karna hai.",
+        parse_mode="Markdown",
+    )
+
+async def startgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("❌ Usage: `/startgroup CHAT_ID`", parse_mode="Markdown")
+        return
+    try:
+        chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid group ID.")
+        return
+    _group_start(chat_id)
+    await update.message.reply_text(f"▶️ Group `{chat_id}` started. Auto-indexing active.", parse_mode="Markdown")
+
+async def stopgroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("❌ Usage: `/stopgroup CHAT_ID`", parse_mode="Markdown")
+        return
+    try:
+        chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid group ID.")
+        return
+    _group_stop(chat_id)
+    await update.message.reply_text(
+        f"⏸ Group `{chat_id}` stopped.\n"
+        "New files is group se auto-index nahi honge. Existing index delete nahi hua.",
+        parse_mode="Markdown",
+    )
+
+async def cleargroup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("❌ Usage: `/cleargroup CHAT_ID`", parse_mode="Markdown")
+        return
+    try:
+        chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid group ID.")
+        return
+    await asyncio.to_thread(_db_grp_execute, "DELETE FROM group_files WHERE chat_id=?", (chat_id,))
+    await update.message.reply_text(f"🗑 Group `{chat_id}` ka poora index clear ho gaya.", parse_mode="Markdown")
+
+async def deleteindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "❌ Usage: `/deleteindex CHAT_ID MESSAGE_ID`\n"
+            "Sirf wahi single index delete hoga.",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        chat_id, message_id = int(args[0]), int(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ CHAT_ID aur MESSAGE_ID numbers hone chahiye.")
+        return
+    rows = await asyncio.to_thread(
+        _db_grp_fetch,
+        "SELECT id FROM group_files WHERE chat_id=? AND message_id=? LIMIT 1",
+        (chat_id, message_id),
+    )
+    if not rows:
+        await update.message.reply_text("ℹ️ Is message ka index nahi mila.", parse_mode="Markdown")
+        return
+    await asyncio.to_thread(
+        _db_grp_execute,
+        "DELETE FROM group_files WHERE chat_id=? AND message_id=?",
+        (chat_id, message_id),
+    )
+    await update.message.reply_text(
+        f"✅ Single index deleted.\nChat: `{chat_id}`\nMessage: `{message_id}`",
+        parse_mode="Markdown",
+    )
+
+async def scanfile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Scan/index exactly one source message; never scans the whole group."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🔒 Admin only.")
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "❌ Usage: `/scanfile CHAT_ID MESSAGE_ID`",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        chat_id, message_id = int(args[0]), int(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ CHAT_ID aur MESSAGE_ID numbers hone chahiye.")
+        return
+
+    existing = await asyncio.to_thread(
+        _db_grp_fetch,
+        "SELECT id FROM group_files WHERE chat_id=? AND message_id=? LIMIT 1",
+        (chat_id, message_id),
+    )
+    if existing:
+        await update.message.reply_text("♻️ Ye file already indexed hai. Duplicate entry nahi banegi.")
+        return
+
+    status = await update.message.reply_text(
+        f"🔎 Single file scan:\nChat `{chat_id}`\nMessage `{message_id}`",
+        parse_mode="Markdown",
+    )
+    try:
+        fwd = await asyncio.wait_for(
+            context.bot.forward_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=chat_id,
+                message_id=message_id,
+                disable_notification=True,
+            ),
+            timeout=15,
+        )
+        ok = False
+        file_obj = fwd.video or fwd.document
+        if file_obj:
+            caption = (fwd.caption or "").strip()
+            if not caption:
+                caption = getattr(file_obj, "file_name", "") or ""
+            if caption.strip():
+                parsed = _parse_caption(caption)
+                ai_info = await _ai_extract_title_info(caption, parsed)
+                clean_title = (ai_info.get("clean_title") or parsed["clean_title"]).lower().strip()
+                final_year = ai_info.get("year") or parsed["year"]
+                content_type = ai_info.get("content_type", "series" if parsed.get("season_ep") else "movie")
+                confidence = ai_info.get("confidence", 0.4)
+                if len(clean_title) >= 2:
+                    file_type = "video" if fwd.video else "document"
+                    size_mb = round(getattr(file_obj, "file_size", 0) / (1024 * 1024), 1) if getattr(file_obj, "file_size", 0) else 0.0
+                    await asyncio.to_thread(
+                        _db_grp_execute,
+                        """INSERT OR IGNORE INTO group_files
+                           (chat_id, message_id, file_id, file_name, clean_title,
+                            quality, language, year, size_mb, file_type,
+                            content_type, ai_confidence, episode, indexed_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            chat_id, message_id, file_obj.file_id, caption[:200],
+                            clean_title, parsed["quality"], parsed["language"],
+                            final_year, size_mb, file_type, content_type,
+                            confidence, parsed["season_ep"], time.time(),
+                        ),
+                    )
+                    ok = True
+        try:
+            await fwd.delete()
+        except Exception:
+            pass
+        if ok:
+            await status.edit_text(
+                f"✅ *Single file indexed!*\n\nChat: `{chat_id}`\nMessage: `{message_id}`",
+                parse_mode="Markdown",
+            )
+        else:
+            await status.edit_text(
+                "⚠️ Message mein supported video/document ya usable filename/caption nahi mila.",
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        try:
+            await status.edit_text(f"❌ Scan error: `{str(e)[:800]}`", parse_mode="Markdown")
+        except Exception:
+            pass
 application = (
     ApplicationBuilder()
     .token(TOKEN)
@@ -6382,6 +6693,7 @@ application = (
     .pool_timeout(30)
     .get_updates_connect_timeout(30)
     .get_updates_read_timeout(30)
+    .concurrent_updates(True)
     .post_init(post_init)
     .build()
 )
@@ -6603,7 +6915,6 @@ print(f"   Groq SDK: {'✅' if _groq_sdk_client else '❌ (pip install groq)'}")
 print(f"   TMDB: {'✅' if TMDB_API else '⚠️ optional'}")
 
 # ── Render port binder ──────────────────────────────────────────────
-# application.run_polling() below never opens a network port — it only
 # makes outbound calls to Telegram. Render's free "Web Service" tier,
 # though, expects something listening on $PORT and answering HTTP
 # requests; without that, Render's health check fails and it kills +
@@ -6641,6 +6952,17 @@ def _start_render_port_binder():
 
 _start_render_port_binder()
 
+
+# --- Restored missing command registrations ---
+application.add_handler(CommandHandler("addgroup", addgroup_cmd))
+application.add_handler(CommandHandler("allgroups", allgroups_cmd))
+application.add_handler(CommandHandler("removegroup", removegroup_cmd))
+application.add_handler(CommandHandler("startgroup", startgroup_cmd))
+application.add_handler(CommandHandler("stopgroup", stopgroup_cmd))
+application.add_handler(CommandHandler("cleargroup", cleargroup_cmd))
+application.add_handler(CommandHandler("deleteindex", deleteindex_cmd))
+application.add_handler(CommandHandler("scanfile", scanfile_cmd))
+application.add_handler(CommandHandler("indexchannel", index_channel_cmd))
 application.run_polling(
     allowed_updates=["message", "callback_query", "inline_query"],
     drop_pending_updates=True,
