@@ -50,7 +50,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 # Groq REST API config (used by the lightweight HTTP-based AI calls)
 GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 def now_ist() -> datetime:
     """Current time as an IST-aware datetime."""
@@ -177,6 +177,7 @@ FILES = {
     "history":     "history.json",
     "votes":       "votes.json",
     "admins":      "admins.json",
+    "_group_state": "_group_state.json",
 }
 
 DEFAULT_SERVERS = {
@@ -242,6 +243,52 @@ def load_servers():
     return data
 
 bot_servers = load_servers()
+
+# ═══════════════════════════════════════════════════════════════════
+#   GROUP MANAGEMENT HELPERS (fixed: were missing in original)
+# ═══════════════════════════════════════════════════════════════════
+_GROUP_STATE_KEY = "_group_state"
+
+def _load_group_state() -> dict:
+    """Load group state from persistent store."""
+    return load_json("_group_state", {"groups": {}, "stopped": []})
+
+def _save_group_state(state: dict):
+    save_json("_group_state", state)
+
+def _group_add(chat_id: int, title: str = ""):
+    state = _load_group_state()
+    groups = state.setdefault("groups", {})
+    groups[str(chat_id)] = {"title": title, "added": now_ist().strftime("%Y-%m-%d %H:%M")}
+    # Remove from stopped list if it was there
+    stopped = state.setdefault("stopped", [])
+    if chat_id in stopped: stopped.remove(chat_id)
+    _save_group_state(state)
+
+def _group_remove(chat_id: int):
+    state = _load_group_state()
+    state.setdefault("groups", {}).pop(str(chat_id), None)
+    stopped = state.setdefault("stopped", [])
+    if chat_id in stopped: stopped.remove(chat_id)
+    _save_group_state(state)
+
+def _group_start(chat_id: int):
+    state = _load_group_state()
+    stopped = state.setdefault("stopped", [])
+    if chat_id in stopped: stopped.remove(chat_id)
+    _save_group_state(state)
+
+def _group_stop(chat_id: int):
+    state = _load_group_state()
+    stopped = state.setdefault("stopped", [])
+    if chat_id not in stopped: stopped.append(chat_id)
+    _save_group_state(state)
+
+def _is_group_stopped(chat_id: int) -> bool:
+    state = _load_group_state()
+    return chat_id in state.get("stopped", [])
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -707,7 +754,7 @@ async def ai_ask(prompt: str, max_tokens: int = 1000) -> Optional[str]:
         "max_tokens": max_tokens,
         "temperature": 0.75,
     }
-    timeout = aiohttp.ClientTimeout(total=5)
+    timeout = aiohttp.ClientTimeout(total=20)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(GROQ_URL, headers=headers, json=payload) as resp:
@@ -6748,6 +6795,337 @@ async def scanfile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.edit_text(f"❌ Scan error: `{str(e)[:800]}`", parse_mode="Markdown")
         except Exception:
             pass
+
+# ══════════════════════════════════════════════════════════════════
+#   🆕 ADVANCED UPGRADES v11 — New Commands + Rate Limiter
+# ══════════════════════════════════════════════════════════════════
+
+import collections as _collections
+_RATE_STORE: dict = {}
+_RATE_LOCK = threading.Lock()
+
+def _rate_check(user_id: int, limit: int = 8, window: int = 30) -> bool:
+    """Return True if user is within rate limit (8 calls per 30s by default)."""
+    now = time.monotonic()
+    uid = str(user_id)
+    with _RATE_LOCK:
+        times = _RATE_STORE.get(uid, _collections.deque())
+        while times and times[0] < now - window:
+            times.popleft()
+        if len(times) >= limit:
+            _RATE_STORE[uid] = times
+            return False
+        times.append(now)
+        _RATE_STORE[uid] = times
+        return True
+
+
+# ─── /top10 — Most searched movies ─────────────────────────────
+async def top10_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id):
+        return
+    top = get_trending(10)
+    if not top:
+        await update.message.reply_text("📊 Abhi koi search nahi hui hai!")
+        return
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    max_count = top[0][1] if top[0][1] > 0 else 1
+    lines = ["🏆 *TOP 10 MOST SEARCHED*", "━" * 18]
+    for i, (title, count) in enumerate(top):
+        bar = _text_bar(count, max_count, width=8)
+        lines.append(medals[i] + " *" + title + "*\n   `" + bar + "` " + str(count) + " searches")
+    lines.append("\n_Type movie naam to search!_ 🔎")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ─── /nowplaying — Movies in theaters right now ─────────────────
+async def nowplaying_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id):
+        return
+    if not TMDB_API:
+        await update.message.reply_text("⚠️ TMDB_API required for /nowplaying!", parse_mode="Markdown")
+        return
+    loader = await update.message.reply_text("🎭 Theaters check kar raha hoon...\n" + progress_bar(1, 3), parse_mode="Markdown")
+    try:
+        url = "https://api.themoviedb.org/3/movie/now_playing?api_key=" + TMDB_API + "&region=IN&language=en-US"
+        r = await asyncio.to_thread(requests.get, url, timeout=8)
+        results = r.json().get("results", [])[:10]
+        if not results:
+            await loader.edit_text("❌ Koi movie nahi mili!", parse_mode="Markdown")
+            return
+        lines = ["🎭 *NOW PLAYING IN THEATERS*", "━" * 18]
+        for m in results:
+            rating = round(m.get("vote_average", 0), 1)
+            stars = build_star_bar(rating)
+            rd = m.get("release_date", "")[:4]
+            lines.append("🎬 *" + m["title"] + "* `(" + rd + ")`\n   " + stars + " `" + str(rating) + "/10`")
+        lines.append("\n_Type naam to search!_ 🔎")
+        await loader.edit_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        await loader.edit_text("❌ Error: " + str(e)[:100], parse_mode="Markdown")
+
+
+# ─── /actor — Movies by actor ─────────────────────────────────
+async def actor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id):
+        return
+    actor_name = " ".join(context.args).strip() if context.args else ""
+    if not actor_name:
+        await update.message.reply_text("❌ *Usage:* `/actor Actor Name`\nExample: `/actor Shah Rukh Khan`", parse_mode="Markdown")
+        return
+    if not TMDB_API:
+        await update.message.reply_text("⚠️ TMDB_API required!", parse_mode="Markdown")
+        return
+    loader = await update.message.reply_text("🌟 " + actor_name + " ki movies dhundh raha hoon...", parse_mode="Markdown")
+    movies = await asyncio.to_thread(get_actor_movies, actor_name)
+    if not movies:
+        await loader.edit_text("❌ *" + actor_name + "* ka koi data nahi mila!\n_Spelling check karo._", parse_mode="Markdown")
+        return
+    lines = ["🌟 *" + actor_name.upper() + " KI TOP MOVIES*", "━" * 18]
+    for i, (title, rating) in enumerate(movies, 1):
+        stars = build_star_bar(rating)
+        lines.append(str(i) + ". *" + title + "*\n   " + stars + " `" + str(rating) + "/10`")
+    lines.append("\n_Type naam to search!_ 🔎")
+    await loader.edit_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ─── /genre — AI recommendations by genre + button menu ──────────────
+async def genre_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id):
+        return
+    if not _rate_check(update.effective_user.id):
+        await update.message.reply_text("⏳ Thoda ruko! Zyada fast requests mat karo.", parse_mode="Markdown")
+        return
+    genre = " ".join(context.args).strip() if context.args else ""
+    if not genre:
+        genres = ["Action", "Comedy", "Horror", "Romance", "Thriller", "Sci-Fi", "Drama", "Animation", "Mystery", "Family"]
+        btns = [[InlineKeyboardButton(g, callback_data="genre_pick_" + g)] for g in genres]
+        await update.message.reply_text("🎭 *Kaunsa genre pasand hai?*\n_Button press karo!_",
+                                        parse_mode="Markdown",
+                                        reply_markup=InlineKeyboardMarkup(btns))
+        return
+    if not GROQ_API:
+        await update.message.reply_text("⚠️ GROQ_API required!", parse_mode="Markdown")
+        return
+    loader = await update.message.reply_text("🎭 Best " + genre + " movies dhundh raha hoon...\n" + progress_bar(1, 3), parse_mode="Markdown")
+    result = await ai_recommend("Best " + genre + " movies recommend karo - mix of Hindi and Hollywood, latest and classics")
+    try:
+        await loader.delete()
+    except Exception:
+        pass
+    if result:
+        await update.message.reply_text("🎭 *BEST " + genre.upper() + " MOVIES*\n" + ("━" * 18) + "\n\n" + result + "\n\n_Type naam to search!_ 🔎", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Recommendations nahi aaye.", parse_mode="Markdown")
+
+
+async def genre_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    genre = query.data.replace("genre_pick_", "")
+    if not GROQ_API:
+        await query.message.reply_text("⚠️ GROQ_API required!", parse_mode="Markdown")
+        return
+    loader = await query.message.reply_text("🎭 Best " + genre + " movies dhundh raha hoon...", parse_mode="Markdown")
+    result = await ai_recommend("Best " + genre + " movies recommend karo - mix of Hindi and Hollywood")
+    try:
+        await loader.delete()
+    except Exception:
+        pass
+    if result:
+        await query.message.reply_text("🎭 *BEST " + genre.upper() + " MOVIES*\n" + ("━" * 18) + "\n\n" + result + "\n\n_Type naam to search!_ 🔎", parse_mode="Markdown")
+    else:
+        await query.message.reply_text("❌ Recommendations nahi aaye.", parse_mode="Markdown")
+
+
+# ─── /year YYYY — Best movies from a specific year ─────────────────
+async def year_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id):
+        return
+    yr = " ".join(context.args).strip() if context.args else ""
+    if not yr or not yr.isdigit() or not (1900 <= int(yr) <= 2030):
+        await update.message.reply_text("❌ *Usage:* `/year 2023`\n_Valid years: 1900 — 2030_", parse_mode="Markdown")
+        return
+    if not TMDB_API:
+        await update.message.reply_text("⚠️ TMDB_API required!", parse_mode="Markdown")
+        return
+    loader = await update.message.reply_text("📅 " + yr + " ki best movies dhundh raha hoon...", parse_mode="Markdown")
+    try:
+        url = ("https://api.themoviedb.org/3/discover/movie?api_key=" + TMDB_API +
+               "&primary_release_year=" + yr + "&sort_by=vote_average.desc&vote_count.gte=500")
+        r = await asyncio.to_thread(requests.get, url, timeout=8)
+        results = r.json().get("results", [])[:8]
+        if not results:
+            await loader.edit_text("❌ " + yr + " mein koi movie nahi mili!", parse_mode="Markdown")
+            return
+        lines = ["📅 *BEST MOVIES OF " + yr + "*", "━" * 18]
+        for m in results:
+            rating = round(m.get("vote_average", 0), 1)
+            stars = build_star_bar(rating)
+            lines.append("🎬 *" + m["title"] + "*\n   " + stars + " `" + str(rating) + "/10`")
+        lines.append("\n_Type naam to search!_ 🔎")
+        await loader.edit_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        await loader.edit_text("❌ Error: " + str(e)[:100], parse_mode="Markdown")
+
+
+# ─── /directorfilms — Best movies by a director ────────────────────
+async def director_search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id):
+        return
+    director = " ".join(context.args).strip() if context.args else ""
+    if not director:
+        await update.message.reply_text("❌ *Usage:* `/directorfilms Christopher Nolan`", parse_mode="Markdown")
+        return
+    if not TMDB_API:
+        await update.message.reply_text("⚠️ TMDB_API required!", parse_mode="Markdown")
+        return
+    loader = await update.message.reply_text("🎥 " + director + " ki movies dhundh raha hoon...", parse_mode="Markdown")
+    movies = await asyncio.to_thread(get_director_movies, director)
+    if not movies:
+        await loader.edit_text("❌ *" + director + "* ka koi data nahi mila!", parse_mode="Markdown")
+        return
+    lines = ["🎥 *" + director.upper() + " KI TOP MOVIES*", "━" * 18]
+    for i, (title, rating) in enumerate(movies, 1):
+        stars = build_star_bar(rating)
+        lines.append(str(i) + ". *" + title + "*\n   " + stars + " `" + str(rating) + "/10`")
+    lines.append("\n_Type naam to search!_ 🔎")
+    await loader.edit_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ─── /watchnow — AI picks ONE movie to watch right now ─────────────
+async def watchnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id):
+        return
+    if not _rate_check(update.effective_user.id):
+        await update.message.reply_text("⏳ Thoda ruko!", parse_mode="Markdown")
+        return
+    history = load_json("history").get(str(update.effective_user.id), [])
+    history_titles = [h["movie"] for h in history[:10]]
+    loader = await update.message.reply_text("🍿 Tumhare liye perfect movie choose kar raha hoon...", parse_mode="Markdown")
+    if GROQ_API and history_titles:
+        seen_str = ", ".join(history_titles[:10])
+        result = await ai_ask(
+            "User ne ye movies dekhi hain: " + seen_str + "\n\n"
+            "ABHI (right now) watch karne ke liye SIRF EK perfect movie suggest karo.\n"
+            "Format: \n🎬 *Movie Name* (Year)\n⭐ Why perfect: [1 line]\n📖 Plot: [1-2 lines]\n🎯 Genre: [type]\n"
+            "Hinglish mein reply karo.",
+            max_tokens=250
+        )
+    else:
+        trending = get_tmdb_trending()
+        if trending:
+            pick = random.choice(trending[:5])
+            result = "🎬 *" + pick[0] + "*\n⭐ IMDb: " + str(pick[1]) + "/10\n\n_Abhi is film se shuru karo!_"
+        else:
+            result = "🎬 *Sholay* (1975)\n⭐ Why perfect: Evergreen classic!\n📖 Two friends vs dacoit.\n🎯 Action/Drama"
+    try:
+        await loader.delete()
+    except Exception:
+        pass
+    text = "🍿 *WATCH NOW PICK*\n" + ("━" * 18) + "\n\n" + (result or "_AI unavailable_") + "\n\n_Search karne ke liye naam type karo!_ 🔎"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ─── /flip — Bollywood vs Hollywood coin flip ──────────────────────
+async def flip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id):
+        return
+    flip = random.choice(["BOLLYWOOD", "HOLLYWOOD"])
+    emoji = "🎪" if flip == "BOLLYWOOD" else "🎬"
+    if GROQ_API:
+        result = await ai_ask(
+            "Ek random " + flip + " movie suggest karo.\n"
+            "Format: " + emoji + " *Movie Name* (Year)\n⭐ Rating: X/10\n📖 [1 line plot]\n"
+            "Hinglish mein.",
+            max_tokens=150
+        )
+        text = ("🎰 *MOVIE FLIP!*\n\nFlip result: *" + flip + "* " + emoji +
+                "\n" + ("━" * 18) + "\n\n" + (result or "_AI unavailable_"))
+    else:
+        bollywood = ["Dilwale Dulhania Le Jayenge", "3 Idiots", "Dangal", "PK", "Lagaan", "Sholay"]
+        hollywood = ["The Dark Knight", "Inception", "Interstellar", "Avengers", "Forrest Gump"]
+        pick = random.choice(bollywood if flip == "BOLLYWOOD" else hollywood)
+        text = ("🎰 *MOVIE FLIP!*\n\nFlip: *" + flip + "* " + emoji +
+                "\n" + ("━" * 18) + "\n🎬 *" + pick + "*\n\n_Type naam to search!_ 🔎")
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ─── /boxoffice — Top rated movies worldwide (TMDB) ────────────────
+async def boxoffice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id):
+        return
+    if not TMDB_API:
+        await update.message.reply_text("⚠️ TMDB_API required!", parse_mode="Markdown")
+        return
+    loader = await update.message.reply_text("💰 Box office chart fetch ho raha hai...", parse_mode="Markdown")
+    try:
+        url = "https://api.themoviedb.org/3/movie/top_rated?api_key=" + TMDB_API + "&language=en-US"
+        r = await asyncio.to_thread(requests.get, url, timeout=8)
+        results = r.json().get("results", [])[:10]
+        if not results:
+            await loader.edit_text("❌ Data nahi mila!", parse_mode="Markdown")
+            return
+        lines = ["💰 *ALL-TIME TOP RATED WORLDWIDE*", "━" * 18]
+        for i, m in enumerate(results, 1):
+            rating = round(m.get("vote_average", 0), 1)
+            lines.append(str(i) + ". 🎬 *" + m["title"] + "* — ⭐ `" + str(rating) + "/10`")
+        lines.append("\n_Type naam to search!_ 🔎")
+        await loader.edit_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        await loader.edit_text("❌ Error: " + str(e)[:100], parse_mode="Markdown")
+
+
+# ─── /myhistory — Detailed user search history ───────────────────
+async def myhistory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id):
+        return
+    uid = str(update.effective_user.id)
+    history = load_json("history").get(uid, [])
+    if not history:
+        await update.message.reply_text("📜 Abhi koi search history nahi hai!\n\n_Movie search karo aur history yahan dikhegi!_", parse_mode="Markdown")
+        return
+    lines = ["📜 *MERI SEARCH HISTORY*", "━" * 18]
+    for i, h in enumerate(history[:20], 1):
+        lines.append(str(i) + ". 🎬 *" + h["movie"] + "*\n   🕐 _" + h["time"] + "_")
+    lines.append("\n_Total: " + str(len(history)) + " searches_ | /clean se clear karo")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ─── /recommend — Smart personalized AI recommendation ───────────
+async def recommend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_banned(update.effective_user.id):
+        return
+    if not _rate_check(update.effective_user.id):
+        await update.message.reply_text("⏳ Thoda ruko!", parse_mode="Markdown")
+        return
+    query_text = " ".join(context.args).strip() if context.args else ""
+    if not GROQ_API:
+        await update.message.reply_text("⚠️ GROQ_API required!", parse_mode="Markdown")
+        return
+    loader = await update.message.reply_text("🤖 AI soch raha hai...\n" + progress_bar(1, 4), parse_mode="Markdown")
+    uid = str(update.effective_user.id)
+    history = load_json("history").get(uid, [])
+    watchlist = load_json("watchlist").get(uid, [])
+    ratings_db = load_json("ratings")
+    loved = [t for t, users in ratings_db.items() if str(update.effective_user.id) in users and users[str(update.effective_user.id)] >= 4]
+    history_titles = [h["movie"] for h in history[:15]]
+    watchlist_titles = [w["title"] for w in watchlist[:10]] if watchlist and isinstance(watchlist[0], dict) else watchlist[:10]
+    if query_text:
+        result = await ai_recommend(query_text + " ke hisaab se 5 movies suggest karo")
+    else:
+        result = await ai_personalized_recommend(history_titles, loved, watchlist_titles)
+    try:
+        await loader.delete()
+    except Exception:
+        pass
+    if result:
+        header = "🤖 *AI PICKS FOR YOU*" if not query_text else "🤖 *AI RECOMMENDATIONS*"
+        await update.message.reply_text(header + "\n" + ("━" * 18) + "\n\n" + result + "\n\n_Type naam to search!_ 🔎", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ AI recommendations nahi aaye. Thodi der baad try karo.", parse_mode="Markdown")
+
+
 application = (
     ApplicationBuilder()
     .token(TOKEN)
@@ -7027,6 +7405,19 @@ application.add_handler(CommandHandler("cleargroup", cleargroup_cmd))
 application.add_handler(CommandHandler("deleteindex", deleteindex_cmd))
 application.add_handler(CommandHandler("scanfile", scanfile_cmd))
 application.add_handler(CommandHandler("indexchannel", index_channel_cmd))
+
+application.add_handler(CommandHandler("top10",        top10_cmd))
+application.add_handler(CommandHandler("nowplaying",   nowplaying_cmd))
+application.add_handler(CommandHandler("actor",        actor_cmd))
+application.add_handler(CommandHandler("genre",        genre_cmd))
+application.add_handler(CommandHandler("year",         year_cmd))
+application.add_handler(CommandHandler(["directorfilms", "dir"], director_search_cmd))
+application.add_handler(CommandHandler("watchnow",     watchnow_cmd))
+application.add_handler(CommandHandler("flip",         flip_cmd))
+application.add_handler(CommandHandler("boxoffice",    boxoffice_cmd))
+application.add_handler(CommandHandler("myhistory",    myhistory_cmd))
+application.add_handler(CommandHandler("recommend",    recommend_cmd))
+application.add_handler(CallbackQueryHandler(genre_pick_cb, pattern="^genre_pick_"))
 application.run_polling(
     allowed_updates=["message", "callback_query", "inline_query"],
     drop_pending_updates=True,
