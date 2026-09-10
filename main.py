@@ -50,7 +50,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 # Groq REST API config (used by the lightweight HTTP-based AI calls)
 GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 def now_ist() -> datetime:
     """Current time as an IST-aware datetime."""
