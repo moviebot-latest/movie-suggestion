@@ -489,9 +489,16 @@ def progress_bar(current, total, length=10):
     return f"[{bar}] {pct}%"
 
 async def animate_search(msg):
-    """Single lightweight progress update; avoid 6 sequential Telegram edits."""
+    """Show an honest indeterminate status; do not imply a fake 50% completion."""
     try:
-        await msg.edit_text("🎬 Searching...\n" + progress_bar(3, 6), parse_mode="Markdown")
+        await msg.edit_text("🎬 Searching movie databases...\n⏳ Please wait", parse_mode="Markdown")
+    except Exception:
+        pass
+
+async def update_search_status(msg, text):
+    """Best-effort status update that never interrupts the search pipeline."""
+    try:
+        await msg.edit_text(text, parse_mode="Markdown")
     except Exception:
         pass
 
@@ -3976,6 +3983,7 @@ async def _run_full_search(update, context, raw_name: str):
         search_name = raw_title_only
 
     # ── STEP 2: Show poster/info card ──
+    await update_search_status(loader, "🎬 Checking movie details...\n⏳ Please wait")
     # A trailing year ("Toxic 2026") is sent as OMDB's own y= param instead
     # of left in the title text — OMDB matches this far more accurately
     # and it disambiguates same-named movies across years.
@@ -4029,13 +4037,19 @@ async def _run_full_search(update, context, raw_name: str):
     # Pass raw_name, not search_name — grp_search does its own AI-fix and
     # year-recovery internally, but that only works if what it receives as
     # "the original" still actually has the year in it.
-    grp_results = await grp_search(raw_name, limit=20)
+    await update_search_status(loader, "🔎 Checking indexed movie files...\n⏳ Please wait")
+    try:
+        grp_results = await asyncio.wait_for(grp_search(raw_name, limit=20), timeout=35)
+    except asyncio.TimeoutError:
+        print(f"⚠️ Group search timed out for query: {raw_name!r}")
+        grp_results = []
     if grp_results:
         try: await loader.delete()
         except: pass
         await _grp_auto_send_or_confirm(context, update.effective_chat.id, grp_results, raw_name, search_name, user.id)
         return
 
+    await update_search_status(loader, "🌐 Checking alternate sources...\n⏳ Please wait")
     await _run_omdb_fallback(update, context, loader, raw_name, search_name, user.id)
 
 
